@@ -83,10 +83,13 @@ public actor Listener {
     /// (guest_server_listen in tailscale.h), which is consumed with the
     /// same tailscale_accept machinery as a tsnet listener. `handle` is
     /// only consulted for error messages.
+    // async like the primary init: the Combine branch's @Published _state
+    // is actor-isolated, and only an async (isolated) initializer may set
+    // it — a sync init fails to compile under Swift 6.
     internal init(adopting fd: TailscaleListener,
                   handle: TailscaleHandle,
                   address: String,
-                  logger: LogSink? = nil) {
+                  logger: LogSink? = nil) async {
         self.logger = logger
         self.tailscale = handle
         self.address = address
