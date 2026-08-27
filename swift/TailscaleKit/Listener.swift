@@ -9,7 +9,7 @@ import libtailscale
 
 #if canImport(Darwin)
 import Darwin
-#else
+#elseif canImport(Glibc)
 import Glibc
 
 #endif
@@ -120,7 +120,7 @@ public actor Listener {
         }
         if ret < 0 {
             close()
-            throw TailscaleError.fromPosixErrCode(errno, "Poll failed")
+            throw TailscaleError.fromPosixErrCode(tailscaleLastSocketError, "Poll failed")
         }
 
         logger?.log("Accepting \(proto.rawValue) connection via \(address)")

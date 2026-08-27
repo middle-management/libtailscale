@@ -3,7 +3,7 @@
 
 #if canImport(Darwin)
 import Darwin
-#else
+#elseif canImport(Glibc)
 import Glibc
 
 #endif
@@ -102,7 +102,7 @@ public actor PacketListener {
                         return
                     }
                     if rc < 0 {
-                        cont.resume(returning: .failure(.fromPosixErrCode(errno, "Poll failed")))
+                        cont.resume(returning: .failure(.fromPosixErrCode(tailscaleLastSocketError, "Poll failed")))
                         return
                     }
 

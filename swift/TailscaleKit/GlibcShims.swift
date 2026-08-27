@@ -6,7 +6,11 @@
 // every file in the module (extend it here, not per-file, when a new syscall
 // needs qualifying). On Apple platforms this file compiles to nothing — the
 // real Darwin module wins.
-#if !canImport(Darwin)
+// Gated on Glibc rather than on "not Darwin": Windows is neither, and has its
+// own stand-ins in WindowsShims.swift. `!canImport(Darwin)` silently assumed
+// not-Darwin means Linux and broke the Windows build with `no such module
+// 'Glibc'`.
+#if canImport(Glibc)
 import Glibc
 
 enum Darwin {
