@@ -122,6 +122,19 @@ static int test_guest(const char* dm_json) {
 		return 1;
 	}
 
+	// The address the token predicts must be the address the frames carry
+	// (Swift's viewer filters inbound datagrams on exactly this match).
+	char predicted[256];
+	if ((ret = guest_client_server_addr(gc, predicted, sizeof(predicted))) != 0) {
+		return set_gc_err('i');
+	}
+	if (strncmp(server_addr, "[", 1) == 0
+			? strncmp(&server_addr[1], predicted, strlen(predicted)) != 0
+			: strncmp(server_addr, predicted, strlen(predicted)) != 0) {
+		snprintf(gerr, errlen, "j: predicted server addr %s, frames carry %s", predicted, server_addr);
+		return 1;
+	}
+
 	// One admitted peer; pull its node key out of the JSON.
 	char peers[2048];
 	if ((ret = guest_server_peers(gs, peers, sizeof(peers))) != 0) {
@@ -147,9 +160,13 @@ static int test_guest(const char* dm_json) {
 		return set_gs_err('b');
 	}
 	write_frame(cfd, "x", want, sizeof(want)); // may fail; flow is dying
-	// Drain anything already in flight pre-eviction, then require silence.
-	while ((n = read_frame(sfd, 2000, client_addr, got, sizeof(got))) > 0) {
-		snprintf(gerr, errlen, "c: server got %zd-byte datagram after evict", n);
+	// Eviction stops NEW traffic; a datagram already in flight when the
+	// flow closed may still land. Drain that race for up to a second,
+	// then require a full 2s of silence.
+	while (read_frame(sfd, 1000, client_addr, got, sizeof(got)) > 0) {
+	}
+	if ((n = read_frame(sfd, 2000, client_addr, got, sizeof(got))) > 0) {
+		snprintf(gerr, errlen, "c: server got %zd-byte datagram after evict settled", n);
 		return 1;
 	}
 	if ((ret = guest_server_peers(gs, peers, sizeof(peers))) != 0) {

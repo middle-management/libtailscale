@@ -49,6 +49,7 @@ extern int GuestServerClose(int gd);
 extern int GuestClientNew(char* token);
 extern int GuestClientDial(int cd, unsigned short port, int* connOut);
 extern int GuestClientDialUDP(int cd, unsigned short port, int* fdOut);
+extern int GuestClientServerAddr(int cd, char* buf, size_t buflen);
 extern int GuestClientErrmsg(int cd, char* buf, size_t buflen);
 extern int GuestClientClose(int cd);
 
@@ -172,6 +173,9 @@ int guest_client_dial(guest_client cd, unsigned short port, tailscale_conn* conn
 }
 int guest_client_dial_udp(guest_client cd, unsigned short port, tailscale_listener* fd_out) {
 	return GuestClientDialUDP(cd, port, fd_out);
+}
+int guest_client_server_addr(guest_client cd, char* buf, size_t buflen) {
+	return GuestClientServerAddr(cd, buf, buflen);
 }
 int guest_client_errmsg(guest_client cd, char* buf, size_t buflen) {
 	return GuestClientErrmsg(cd, buf, buflen);
