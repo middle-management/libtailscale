@@ -3,6 +3,7 @@
 
 import Combine
 import Foundation
+import libtailscale
 
 /// A Listener is used to await incoming connections from another
 /// Tailnet node.
