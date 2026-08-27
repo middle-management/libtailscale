@@ -79,6 +79,22 @@ public actor Listener {
         _state = .listening
     }
 
+    /// Adopts an already-open listener fd — a guest node's TCP listener
+    /// (guest_server_listen in tailscale.h), which is consumed with the
+    /// same tailscale_accept machinery as a tsnet listener. `handle` is
+    /// only consulted for error messages.
+    internal init(adopting fd: TailscaleListener,
+                  handle: TailscaleHandle,
+                  address: String,
+                  logger: LogSink? = nil) {
+        self.logger = logger
+        self.tailscale = handle
+        self.address = address
+        self.proto = .tcp
+        self.listener = fd
+        _state = .listening
+    }
+
     deinit {
         if listener != 0 {
             Darwin.close(listener)
