@@ -19,11 +19,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 	"unsafe"
 
-	"golang.org/x/sys/unix"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
 	"tailscale.com/tsnet"
@@ -60,7 +58,7 @@ var listeners struct {
 type listener struct {
 	s  *server
 	ln net.Listener
-	fd int // go side fd of socketpair sent to C
+	sp bridgeStream // go side of the bridge pair whose C end went to C
 	mu sync.Mutex
 	m  map[C.int]net.Addr //maps fds to remote addresses for lookup
 }
@@ -74,7 +72,7 @@ var conns struct {
 type conn struct {
 	s *tsnet.Server
 	c net.Conn
-	r *os.File // r is the local socket to the C client
+	r bridgeStream // r is the local socket to the C client
 }
 
 func (s *server) recErr(err error) C.int {
@@ -227,34 +225,40 @@ func TsnetListen(sd C.int, network, addr *C.char, listenerOut *C.int) C.int {
 	}
 	s.started = true
 
-	// The tailscale_listener we return to C is one side of a socketpair(2).
+	// The tailscale_listener we return to C is one side of a bridge socket
+	// pair (socketpair(2) on Unix, a loopback pair on Windows).
 	// We do this so we can proactively call ln.Accept in a goroutine and
 	// feed an fd for the connection through the listener. This lets C use
 	// epoll on the tailscale_listener to know if it should call
 	// tailscale_accept, which avoids a blocking call on the far side.
-	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
+	spRaw, fdC, err := newBridgeStreamPair()
 	if err != nil {
 		return s.recErr(err)
 	}
-	sp := fds[1]
-	fdC := C.int(fds[0])
+	// The accept handoff needs more than the io half of the seam: on Unix it
+	// is an SCM_RIGHTS sendmsg, on Windows a plain record write.
+	sp, ok := spRaw.(bridgeConnSender)
+	if !ok {
+		spRaw.Close()
+		return s.recErr(fmt.Errorf("libtailscale: bridge stream %T cannot hand over connections", spRaw))
+	}
 
 	listeners.mu.Lock()
 	if listeners.m == nil {
 		listeners.m = map[C.int]*listener{}
 	}
-	listener := &listener{s: s, ln: ln, fd: sp, m: map[C.int]net.Addr{}}
+	listener := &listener{s: s, ln: ln, sp: sp, m: map[C.int]net.Addr{}}
 	listeners.m[fdC] = listener
 	listeners.mu.Unlock()
 
 	cleanup := func() {
 		// If fdC is closed on the C side, then we end up calling
-		// into cleanup twice. Be careful to avoid syscall.Close
-		// twice as the FD may have been reallocated.
+		// into cleanup twice. Be careful to avoid closing the Go end
+		// twice as the descriptor may have been reallocated.
 		listeners.mu.Lock()
 		if tsLn, ok := listeners.m[fdC]; ok && tsLn.ln == ln {
 			delete(listeners.m, fdC)
-			syscall.Close(sp)
+			sp.Close()
 		}
 		listeners.mu.Unlock()
 
@@ -264,10 +268,8 @@ func TsnetListen(sd C.int, network, addr *C.char, listenerOut *C.int) C.int {
 		// fdC is never written to, so trying to read from sp blocks
 		// until fdC is closed. We use this as a signal that C is
 		// done with the listener, and we can tear it down.
-		//
-		// TODO: would using os.NewFile avoid a locked up thread?
 		var buf [256]byte
-		syscall.Read(sp, buf[:])
+		sp.Read(buf[:])
 		cleanup()
 	}()
 	go func() {
@@ -285,28 +287,26 @@ func TsnetListen(sd C.int, network, addr *C.char, listenerOut *C.int) C.int {
 				netConn.Close()
 				continue
 			}
-			rights := syscall.UnixRights(int(connFd))
-			// Carry the remote address inband alongside the SCM_RIGHTS fd so
-			// the consumer (TsnetAccept) can key it by the fd number it
-			// actually receives. Keying the lookup table by connFd here is
-			// wrong: SCM_RIGHTS hands the receiver a *fresh* fd number (a dup
-			// of the same open file description), so a later
+			// Carry the remote address inband alongside the handed-over
+			// descriptor so the consumer (TsnetAccept) can key it by the
+			// number it actually receives. Keying the lookup table by connFd
+			// here is wrong on Unix: SCM_RIGHTS hands the receiver a *fresh*
+			// fd number (a dup of the same open file description), so a later
 			// tailscale_getremoteaddr(receivedFd) misses the connFd-keyed
 			// entry and returns EBADF non-deterministically. A fixed-size
-			// field keeps the stream-socket framing aligned per accepted fd.
+			// field keeps the framing aligned per accepted connection.
 			var addrBuf [256]byte
 			copy(addrBuf[:255], netConn.RemoteAddr().String())
-			err = syscall.Sendmsg(sp, addrBuf[:], rights, nil, 0)
-			if err != nil {
+			if err := sp.sendConn(connFd, addrBuf[:]); err != nil {
 				// We handle sp being closed in the read goroutine above.
 				if s.s.Logf != nil {
-					s.s.Logf("libtailscale.accept: sendmsg failed: %v", err)
+					s.s.Logf("libtailscale.accept: sendConn failed: %v", err)
 				}
 				netConn.Close()
 				// fallthrough to close connFd, then continue Accept()ing
 			}
 
-			syscall.Close(int(connFd)) // now owned by recvmsg
+			closeBridgeCSide(connFd) // now owned by the receiver
 		}
 	}()
 
@@ -324,30 +324,14 @@ func TsnetAccept(listenerFd C.int, connOut *C.int) C.int {
 		return C.EBADF
 	}
 
-	buf := make([]byte, unix.CmsgLen(int(unsafe.Sizeof((C.int)(0)))))
 	// The accept goroutine sends the connection's remote address inband as a
-	// fixed 256-byte field alongside the SCM_RIGHTS fd (see the sender side).
+	// fixed 256-byte field alongside the descriptor (see the sender side).
 	addrBuf := make([]byte, 256)
-	n, oobn, _, _, err := syscall.Recvmsg(int(listenerFd), addrBuf, buf, 0)
+	connFd, n, err := recvBridgeConn(listenerFd, addrBuf)
 	if err != nil {
 		return ln.s.recErr(err)
 	}
-
-	scms, err := syscall.ParseSocketControlMessage(buf[:oobn])
-	if err != nil {
-		return ln.s.recErr(err)
-	}
-	if len(scms) != 1 {
-		return ln.s.recErr(fmt.Errorf("libtailscale: got %d control messages, want 1", len(scms)))
-	}
-	fds, err := syscall.ParseUnixRights(&scms[0])
-	if err != nil {
-		return ln.s.recErr(err)
-	}
-	if len(fds) != 1 {
-		return ln.s.recErr(fmt.Errorf("libtailscale: got %d FDs, want 1", len(fds)))
-	}
-	*connOut = (C.int)(fds[0])
+	*connOut = connFd
 
 	// Key the remote-address table by the fd we just handed C — the same fd
 	// it will pass back to tailscale_getremoteaddr. (See the sender side in
@@ -374,13 +358,11 @@ func (a stringAddr) Network() string { return "tcp" }
 func (a stringAddr) String() string  { return string(a) }
 
 func newConn(s *server, netConn net.Conn, connOut *C.int) error {
-	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
+	r, fdC, err := newBridgeStreamPair()
 	if err != nil {
 		return err
 	}
-	r := os.NewFile(uintptr(fds[1]), "socketpair-r")
 	c := &conn{s: s.s, c: netConn, r: r}
-	fdC := C.int(fds[0])
 
 	conns.mu.Lock()
 	if conns.m == nil {
@@ -409,7 +391,7 @@ func newConn(s *server, netConn net.Conn, connOut *C.int) error {
 		defer connCleanup()
 		var b [1 << 16]byte
 		io.CopyBuffer(r, netConn, b[:])
-		syscall.Shutdown(int(r.Fd()), syscall.SHUT_WR)
+		r.CloseWrite()
 		if cr, ok := netConn.(interface{ CloseRead() error }); ok {
 			cr.CloseRead()
 		}
@@ -418,7 +400,7 @@ func newConn(s *server, netConn net.Conn, connOut *C.int) error {
 		defer connCleanup()
 		var b [1 << 16]byte
 		io.CopyBuffer(netConn, r, b[:])
-		syscall.Shutdown(int(r.Fd()), syscall.SHUT_RD)
+		r.CloseRead()
 		if cw, ok := netConn.(interface{ CloseWrite() error }); ok {
 			cw.CloseWrite()
 		}
@@ -687,14 +669,13 @@ func TsnetEnableFunnelToLocalhostPlaintextHttp1(sd C.int, localhostPort C.int) C
 }
 
 // packetListeners tracks tsnet UDP PacketConns surfaced to C as
-// SOCK_DGRAM socketpair fds. tsnet.Server.Listen does not support UDP
+// datagram bridge descriptors. tsnet.Server.Listen does not support UDP
 // (Go's net.Listen has no UDP variant), so libtailscale upstream
 // only exposes TCP listeners. This adds a parallel UDP path via
 // tsnet.Server.ListenPacket. Each datagram on the socketpair is framed
 // as [1B addr_len][addr_bytes][payload] so the C side can preserve the
 // per-packet source/destination address — a real UDP socket gets that
-// from recvfrom/sendto, which the socketpair bridge can't pass through
-// natively.
+// from recvfrom/sendto, which the bridge can't pass through natively.
 var packetListeners struct {
 	mu sync.Mutex
 	m  map[C.int]*packetListener
@@ -703,8 +684,8 @@ var packetListeners struct {
 type packetListener struct {
 	s    *server
 	pc   net.PacketConn
-	fd   int    // go side fd of socketpair
-	cFd  C.int  // C side fd (key in packetListeners.m)
+	pkt  bridgePacket // go side of the datagram bridge pair
+	cFd  C.int        // C side fd (key in packetListeners.m)
 	once sync.Once
 }
 
@@ -715,8 +696,8 @@ type packetListener struct {
 //
 // Ordering inside the body matters:
 //  1. Remove from the map first (under lock) so no new caller can see this pl.
-//  2. Close the Go side of the socketpair (goFd) — unblocks syscall.Read in
-//     the socketpair→PacketConn goroutine.
+//  2. Close the Go side of the bridge pair — unblocks the read in the
+//     bridge→PacketConn goroutine.
 //  3. Close the C side of the socketpair (cFd) — fd is owned by Go end-to-end
 //     when called from TsnetListenPacketClose; Swift must not call Darwin.close
 //     on the same fd afterward.
@@ -726,8 +707,8 @@ func (pl *packetListener) closeOnce() {
 	pl.once.Do(func() {
 		packetListeners.mu.Lock()
 		delete(packetListeners.m, pl.cFd)
-		_ = syscall.Close(pl.fd)
-		_ = syscall.Close(int(pl.cFd))
+		_ = pl.pkt.Close()
+		_ = closeBridgeCSide(pl.cFd)
 		packetListeners.mu.Unlock()
 		pl.pc.Close()
 	})
@@ -747,27 +728,19 @@ func TsnetListenPacket(sd C.int, network, addr *C.char, listenerOut *C.int) C.in
 	}
 	s.started = true
 
-	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_DGRAM, 0)
+	// Default datagram socket buffers are a few KB. RTP at 60fps with the
+	// occasional keyframe burst will overflow that and the kernel will drop
+	// datagrams silently. 4 MB on each side is roughly half a second of
+	// 60Mbps video — enough headroom for a brief stall on the C side without
+	// losing frames.
+	const sockBuf = 4 * 1024 * 1024
+	pkt, fdC, err := newBridgePacketPair(sockBuf)
 	if err != nil {
 		pc.Close()
 		return s.recErr(err)
 	}
 
-	// macOS defaults SOCK_DGRAM unix socket buffers to a few KB. RTP at
-	// 60fps with the occasional keyframe burst will overflow that and
-	// the kernel will drop datagrams silently. 4 MB on each side is
-	// roughly half a second of 60Mbps video — enough headroom for a
-	// brief stall on the C side without losing frames.
-	const sockBuf = 4 * 1024 * 1024
-	syscall.SetsockoptInt(fds[0], syscall.SOL_SOCKET, syscall.SO_SNDBUF, sockBuf)
-	syscall.SetsockoptInt(fds[0], syscall.SOL_SOCKET, syscall.SO_RCVBUF, sockBuf)
-	syscall.SetsockoptInt(fds[1], syscall.SOL_SOCKET, syscall.SO_SNDBUF, sockBuf)
-	syscall.SetsockoptInt(fds[1], syscall.SOL_SOCKET, syscall.SO_RCVBUF, sockBuf)
-
-	goFd := fds[1]
-	fdC := C.int(fds[0])
-
-	pl := &packetListener{s: s, pc: pc, fd: goFd, cFd: fdC}
+	pl := &packetListener{s: s, pc: pc, pkt: pkt, cFd: fdC}
 	packetListeners.mu.Lock()
 	if packetListeners.m == nil {
 		packetListeners.m = map[C.int]*packetListener{}
@@ -775,9 +748,9 @@ func TsnetListenPacket(sd C.int, network, addr *C.char, listenerOut *C.int) C.in
 	packetListeners.m[fdC] = pl
 	packetListeners.mu.Unlock()
 
-	// PacketConn → socketpair. Read each tailnet datagram, prepend its
-	// source address, write the framed message to the socketpair as one
-	// datagram. Closing pc (via pl.closeOnce) breaks the ReadFrom loop.
+	// PacketConn → bridge. Read each tailnet datagram, prepend its source
+	// address, write the framed message to the bridge as one datagram.
+	// Closing pc (via pl.closeOnce) breaks the ReadFrom loop.
 	go func() {
 		defer pl.closeOnce()
 		var buf [1 << 16]byte
@@ -796,20 +769,20 @@ func TsnetListenPacket(sd C.int, network, addr *C.char, listenerOut *C.int) C.in
 			out[0] = byte(len(addrStr))
 			copy(out[1:], addrStr)
 			copy(out[1+len(addrStr):], buf[:n])
-			if _, err := syscall.Write(goFd, out); err != nil {
+			if _, err := pkt.Write(out); err != nil {
 				return
 			}
 		}
 	}()
 
-	// socketpair → PacketConn. Read each framed message from the C
+	// bridge → PacketConn. Read each framed message from the C
 	// side, resolve the destination address, write a UDP datagram. A
 	// short read or zero-length read means the C side closed its fd.
 	go func() {
 		defer pl.closeOnce()
 		var buf [1 << 16]byte
 		for {
-			n, err := syscall.Read(goFd, buf[:])
+			n, err := pkt.Read(buf[:])
 			if err != nil || n == 0 {
 				return
 			}
