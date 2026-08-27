@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 let kLocalAPIPath = "/localapi/v0/"
 
@@ -146,7 +149,7 @@ public actor LocalAPIClient {
         if let error { throw error }
     }
 
-    func logout() async throws {
+    public func logout() async throws {
         let error = await doSimpleAPIRequest(
             endpoint: .logout,
             method: .POST,
@@ -246,7 +249,16 @@ public actor LocalAPIClient {
                                      headers: [String: String]? = nil,
                                      params: [URLQueryItem]? = nil) async throws -> (URLRequest, URLSessionConfiguration) {
 
+#if canImport(Network)
         let (sessionConfig, loopbackConfig) = try await URLSessionConfiguration.tailscaleSession(node)
+#else
+        // No Network.framework ProxyConfiguration off-Apple — and LocalAPI
+        // doesn't need the SOCKS hop: the tsnet loopback listener serves
+        // LocalAPI over plain HTTP at its own address, authenticated by the
+        // Authorization/Sec-Tailscale headers set below.
+        let sessionConfig = URLSessionConfiguration.default
+        let loopbackConfig = try await node.loopback()
+#endif
 
         var endpointPath = endpoint.rawValue
         if let path {

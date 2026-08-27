@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 let kJsonNewline = UInt8(ascii: "\n")
 

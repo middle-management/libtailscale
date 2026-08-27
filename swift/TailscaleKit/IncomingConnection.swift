@@ -1,8 +1,20 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+#if canImport(Combine)
 import Combine
+#endif
 import Foundation
+#if canImport(libtailscale)
+import libtailscale
+#endif
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+
+#endif
 
 /// IncomingConnection is use to read incoming message from an inbound
 /// connection.   IncomingConnections are not instantiated directly,
@@ -14,6 +26,7 @@ public actor IncomingConnection {
 
     public let remoteAddress: String?
 
+#if canImport(Combine)
     @Published var _state: ConnectionState = .idle
 
     public func state() -> any AsyncSequence<ConnectionState, Never>  {
@@ -22,6 +35,24 @@ public actor IncomingConnection {
             .eraseToAnyPublisher()
             .values
     }
+#else
+    // Combine is Apple-only; AsyncStream provides the same
+    // current-value-then-updates sequence on other platforms.
+    var _state: ConnectionState = .idle {
+        didSet {
+            guard _state != oldValue else { return }
+            for continuation in stateContinuations { continuation.yield(_state) }
+        }
+    }
+    private var stateContinuations: [AsyncStream<ConnectionState>.Continuation] = []
+
+    public func state() -> any AsyncSequence<ConnectionState, Never> {
+        AsyncStream { continuation in
+            continuation.yield(_state)
+            stateContinuations.append(continuation)
+        }
+    }
+#endif
 
     init(conn: TailscaleConnection, remoteAddress: String?, logger: LogSink? = nil) async {
         self.logger = logger
@@ -62,6 +93,27 @@ public actor IncomingConnection {
         }
 
         return try await reader.readAll(timeout: timeout)
+    }
+
+    /// Sends the given data to the connection.
+    /// Loops until every byte is written or an error is returned.
+    public func send(_ data: Data) throws {
+        guard _state == .connected else {
+            throw TailscaleError.connectionClosed
+        }
+
+        try data.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
+            guard var ptr = buffer.baseAddress else { return }
+            var remaining = buffer.count
+            while remaining > 0 {
+                let written = Darwin.write(conn, ptr, remaining)
+                if written <= 0 {
+                    throw TailscaleError.shortWrite
+                }
+                remaining -= written
+                ptr = ptr.advanced(by: written)
+            }
+        }
     }
 }
 

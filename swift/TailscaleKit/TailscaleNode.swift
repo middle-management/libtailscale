@@ -1,7 +1,19 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+#if canImport(CGoRuntimeInit)
+import CGoRuntimeInit
+#else
+// CGoRuntimeInit is a Windows-only Go-runtime bootstrap supplied by the
+// consuming SwiftPM package (Tailscreen's Packages/TailscaleKit); on every
+// other platform the C function is empty. Builds without that module —
+// this repo's own Xcode project — get the same no-op.
+func ts_go_runtime_start() {}
+#endif
 import Foundation
+#if canImport(libtailscale)
+import libtailscale
+#endif
 
 public let kDefaultControlURL = "https://controlplane.tailscale.com"
 
@@ -61,6 +73,23 @@ public actor TailscaleNode {
     /// @throws TailscaleError on failure
     public init(config: Configuration, logger: LogSink?) throws {
         self.logger = logger ?? BlackholeLogger()
+
+        // Make sure the Go runtime inside libtailscale.a is actually running
+        // before the first call into it.
+        //
+        // On Windows it is not, and nothing in the build says so: a Go
+        // c-archive asks the C runtime to start it through a `.ctors`
+        // section, which is MinGW's convention, and Swift links with MSVC's
+        // — which walks `.CRT$XCU` and has never read `.ctors`. The
+        // initialiser ships in the executable and is never called, so
+        // `tailscale_new()` below parks forever in
+        // `_cgo_wait_runtime_init_done`: no error, no log line, no timeout.
+        // A frozen app was the only symptom.
+        //
+        // Idempotent, and an empty function on Darwin and Linux, where the
+        // system loader runs the archive's initialiser itself. Here rather
+        // than in a host app because forgetting it is not a compile error.
+        ts_go_runtime_start()
 
         tailscale = tailscale_new()
 

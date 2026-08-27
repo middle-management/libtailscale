@@ -24,8 +24,13 @@ check: libtailscale.tar.zst
 clean:
 	rm -rf ./libtailscale.tar.zst ../vendor ./libtailscale
 
-../vendor: ../go.mod ../go.sum ../tailscale.go Makefile.src Makefile
+# Every non-test source of the root package, plus the guest package it
+# imports (same module, so vendoring never covers it).
+GO_SRCS=../tailscale.go ../bridge.go ../bridge_unix.go ../bridge_windows.go ../guestnode.go
+GO_PKGS=../guest
+
+../vendor: ../go.mod ../go.sum $(GO_SRCS) Makefile.src Makefile
 	go mod vendor
 
-libtailscale.tar.zst: Makefile.src configure ../vendor ../LICENSE ../tailscale.go ../go.mod ../go.sum
-	$(TAR) --transform 's#^#libtailscale/#' --transform 's#Makefile.src#Makefile#' -acf $@ Makefile.src configure ../vendor ../LICENSE ../tailscale.go ../go.mod ../go.sum
+libtailscale.tar.zst: Makefile.src configure ../vendor ../LICENSE $(GO_SRCS) $(GO_PKGS) ../go.mod ../go.sum
+	$(TAR) --transform 's#^#libtailscale/#' --transform 's#Makefile.src#Makefile#' -acf $@ Makefile.src configure ../vendor ../LICENSE $(GO_SRCS) $(GO_PKGS) ../go.mod ../go.sum
