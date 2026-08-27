@@ -1,7 +1,12 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+#if canImport(Darwin)
 import Darwin
+#else
+import Glibc
+
+#endif
 import Foundation
 import libtailscale
 
