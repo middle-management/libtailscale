@@ -122,14 +122,14 @@ public actor GuestServerNode {
     /// address. The returned ``Listener`` accepts with the same machinery
     /// as a tsnet listener (`tailscale_accept`), so the framed control
     /// channel's code works unchanged.
-    public func listen(port: UInt16) throws -> Listener {
+    public func listen(port: UInt16) async throws -> Listener {
         var fd: TailscaleListener = 0
         let res = guest_server_listen(handle, port, &fd)
         guard res == 0 else {
             throw TailscaleError.fromPosixErrCode(res, handle.getErrorMessage())
         }
-        return Listener(adopting: fd, handle: handle,
-                        address: "guest:\(port)", logger: logger)
+        return await Listener(adopting: fd, handle: handle,
+                              address: "guest:\(port)", logger: logger)
     }
 
     /// The currently-admitted clients, in admission order.
