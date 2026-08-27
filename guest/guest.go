@@ -73,6 +73,7 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
+	"tailscale.com/types/nettype"
 	"tailscale.com/types/views"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/mak"
@@ -227,6 +228,10 @@ type locoBackend struct {
 	// peer map lookup. Set before createEngine.
 	onDERPRecv func(regionID int, src key.NodePublic, pkt []byte) bool
 
+	// skipEndpointAdvertise mirrors Server/Client.skipEndpointAdvertise,
+	// copied in at startup (before any peer exists to advertise to).
+	skipEndpointAdvertise bool
+
 	mu             sync.Mutex
 	clients        map[key.NodePublic]*tailcfg.Node // for the server
 	nm             *netmap.NetworkMap
@@ -335,6 +340,30 @@ type Server struct {
 	//
 	// It must be set before calling Start.
 	ServedTCPPorts []filter.PortRange
+
+	// OnUDP, if non-nil, specifies a func that returns a handler for
+	// incoming UDP flows to the provided port on the server's own
+	// address. If nil or if it returns nil, the flow is rejected.
+	//
+	// Local addition (not in upstream tailcat, which carries TCP only):
+	// Tailscreen's media path is RTP over UDP. The handler receives a
+	// connected flow; replies written to it ride the same flow back.
+	//
+	// It must be set before calling Start.
+	OnUDP func(port uint16) (handler func(nettype.ConnPacketConn))
+
+	// ServedUDPPorts, like ServedTCPPorts, restricts which UDP ports on
+	// the server's own address the packet filter admits new inbound
+	// flows to. If nil, flows to all ports reach OnUDP. Local addition.
+	//
+	// It must be set before calling Start.
+	ServedUDPPorts []filter.PortRange
+
+	// skipEndpointAdvertise, when true, keeps advertiseEndpoints from
+	// telling peers our UDP endpoints, so no direct path is ever
+	// discovered and all traffic stays DERP-relayed. Test-only (see
+	// export_test.go): it exists to pin the relayed path deliberately.
+	skipEndpointAdvertise bool
 }
 
 // Start connects to the DERP relay and begins accepting clients,
@@ -422,6 +451,7 @@ func (s *Server) Start() error {
 		return false
 	}
 
+	lb.skipEndpointAdvertise = s.skipEndpointAdvertise
 	if err := createEngine(logf, lb); err != nil {
 		return fmt.Errorf("createEngine: %w", err)
 	}
@@ -449,6 +479,15 @@ func (s *Server) Start() error {
 		}
 		return s.OnTCPForward(dst), true
 	}
+	// Local addition: UDP flows to the server's own address, dispatched
+	// like OnTCP. No UDP forward/exit-node counterpart — reject anything
+	// not addressed to us.
+	ns.GetUDPHandlerForFlow = func(src, dst netip.AddrPort) (handler func(nettype.ConnPacketConn), intercept bool) {
+		if dst.Addr() == lb.addr && s.OnUDP != nil {
+			return s.OnUDP(dst.Port()), true
+		}
+		return nil, true // reject
+	}
 	lb.ns = ns
 	sys.Set(ns)
 
@@ -460,7 +499,8 @@ func (s *Server) Start() error {
 		return ns.DialContextTCP(ctx, dst)
 	}
 	dialer.NetstackDialUDP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
-		panic("unreachable from tailcat") // but required by Dialer currently
+		// Local addition: real UDP dialing (upstream tailcat panics here).
+		return ns.DialContextUDP(ctx, dst)
 	}
 
 	sys.Tun.Get().Start()
@@ -495,6 +535,23 @@ func (s *Server) buildFilter() *filter.Filter {
 		Srcs:    []netip.Prefix{allIPv6},
 		Dsts:    selfDsts,
 	}}
+
+	// Local addition: admit UDP to the server's own address (limited to
+	// ServedUDPPorts if set). GetUDPHandlerForFlow remains the per-flow
+	// gate behind the filter, exactly as OnTCP is for TCP.
+	udpSelfPorts := []filter.PortRange{allTCPPorts} // 0-65535; proto-agnostic range
+	if s.ServedUDPPorts != nil {
+		udpSelfPorts = s.ServedUDPPorts
+	}
+	var udpSelfDsts []filter.NetPortRange
+	for _, pr := range udpSelfPorts {
+		udpSelfDsts = append(udpSelfDsts, filter.NetPortRange{Net: lb.addrPrefix, Ports: pr})
+	}
+	matches = append(matches, filter.Match{
+		IPProto: views.SliceOf([]ipproto.Proto{ipproto.UDP}),
+		Srcs:    []netip.Prefix{allIPv6},
+		Dsts:    udpSelfDsts,
+	})
 
 	var localNets netipx.IPSetBuilder
 	localNets.AddPrefix(lb.addrPrefix)
@@ -1097,6 +1154,9 @@ func (b *locoBackend) advertiseEndpoints() {
 		// https://github.com/tailscale/tailcat/issues/4.
 		return
 	}
+	if b.skipEndpointAdvertise {
+		return // test-only: stay DERP-relayed (see Server/Client hooks)
+	}
 	b.mu.Lock()
 	eps := slices.Clone(b.eps)
 	var peers []tailcfg.NodeView
@@ -1386,6 +1446,9 @@ type Client struct {
 	// If set, it must be set before the client's first use.
 	Key key.NodePrivate
 
+	// skipEndpointAdvertise: see Server.skipEndpointAdvertise. Test-only.
+	skipEndpointAdvertise bool
+
 	// Logf is the logger used for debug messages. If nil, log.Printf
 	// is used. If set, it must be set before the client's first use.
 	Logf logger.Logf
@@ -1495,6 +1558,7 @@ func (c *Client) initLocked() error {
 		return true // client ignores MeowPing
 	}
 
+	lb.skipEndpointAdvertise = c.skipEndpointAdvertise
 	if err := createEngine(logf, lb); err != nil {
 		return fmt.Errorf("createEngine: %w", err)
 	}
@@ -1526,7 +1590,8 @@ func (c *Client) initLocked() error {
 		return ns.DialContextTCP(ctx, dst)
 	}
 	dialer.NetstackDialUDP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
-		panic("unreachable from tailcat") // but required by Dialer currently
+		// Local addition: real UDP dialing (upstream tailcat panics here).
+		return ns.DialContextUDP(ctx, dst)
 	}
 	sys.Tun.Get().Start()
 
@@ -1738,6 +1803,18 @@ var (
 	nat64Prefix      = netip.MustParsePrefix("64:ff9b::/96")
 	nat64PrefixBytes = nat64Prefix.Addr().As16()
 )
+
+// DialUDPPort opens a connected UDP flow to the given port on the server.
+// Datagrams written to the returned conn arrive at the server's OnUDP
+// handler for that port; datagrams the handler writes back arrive on this
+// conn. Local addition (upstream tailcat carries TCP only).
+// See [Client.Dial] for the lazy startup behavior.
+func (c *Client) DialUDPPort(ctx context.Context, port uint16) (net.Conn, error) {
+	if err := c.up(ctx); err != nil {
+		return nil, err
+	}
+	return c.lb.sys.Dialer.Get().UserDial(ctx, "udp", net.JoinHostPort(c.serverAddr.String(), fmt.Sprint(port)))
+}
 
 // DialTCP opens a TCP connection to an arbitrary IP:port through the server,
 // which must be configured as an exit node (see [Server.OnTCPForward]).
