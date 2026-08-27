@@ -2,9 +2,16 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 #include "tailscale.h"
-#include <sys/socket.h>
 #include <stdio.h>
+
+// These are unused by this file — every function below is a pass-through to an
+// exported Go symbol — but they are POSIX-only and would fail the Windows
+// build outright. Kept behind a guard rather than deleted so a future addition
+// that does need them on Unix still finds them where it expects.
+#ifndef _WIN32
+#include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 // Functions exported by Go.
 extern int TsnetNewServer();
