@@ -3,6 +3,7 @@
 
 import Foundation
 import Combine
+import libtailscale
 
 /// ConnectionState indicates the state of individual TSConnection instances
 public enum ConnectionState {
