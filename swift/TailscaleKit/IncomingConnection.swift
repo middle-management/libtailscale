@@ -1,9 +1,18 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+#if canImport(Combine)
 import Combine
+#endif
 import Foundation
 import libtailscale
+
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+
+#endif
 
 /// IncomingConnection is use to read incoming message from an inbound
 /// connection.   IncomingConnections are not instantiated directly,
@@ -15,6 +24,7 @@ public actor IncomingConnection {
 
     public let remoteAddress: String?
 
+#if canImport(Combine)
     @Published var _state: ConnectionState = .idle
 
     public func state() -> any AsyncSequence<ConnectionState, Never>  {
@@ -23,6 +33,24 @@ public actor IncomingConnection {
             .eraseToAnyPublisher()
             .values
     }
+#else
+    // Combine is Apple-only; AsyncStream provides the same
+    // current-value-then-updates sequence on other platforms.
+    var _state: ConnectionState = .idle {
+        didSet {
+            guard _state != oldValue else { return }
+            for continuation in stateContinuations { continuation.yield(_state) }
+        }
+    }
+    private var stateContinuations: [AsyncStream<ConnectionState>.Continuation] = []
+
+    public func state() -> any AsyncSequence<ConnectionState, Never> {
+        AsyncStream { continuation in
+            continuation.yield(_state)
+            stateContinuations.append(continuation)
+        }
+    }
+#endif
 
     init(conn: TailscaleConnection, remoteAddress: String?, logger: LogSink? = nil) async {
         self.logger = logger

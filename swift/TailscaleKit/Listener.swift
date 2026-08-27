@@ -1,9 +1,18 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+#if canImport(Combine)
 import Combine
+#endif
 import Foundation
 import libtailscale
+
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+
+#endif
 
 /// A Listener is used to await incoming connections from another
 /// Tailnet node.
@@ -15,6 +24,7 @@ public actor Listener {
 
     private let logger: LogSink?
 
+#if canImport(Combine)
     @Published var _state: ListenerState = .idle
 
     public func state() -> any AsyncSequence<ListenerState, Never> {
@@ -23,6 +33,24 @@ public actor Listener {
             .eraseToAnyPublisher()
             .values
     }
+#else
+    // Combine is Apple-only; AsyncStream provides the same
+    // current-value-then-updates sequence on other platforms.
+    var _state: ListenerState = .idle {
+        didSet {
+            guard _state != oldValue else { return }
+            for continuation in stateContinuations { continuation.yield(_state) }
+        }
+    }
+    private var stateContinuations: [AsyncStream<ListenerState>.Continuation] = []
+
+    public func state() -> any AsyncSequence<ListenerState, Never> {
+        AsyncStream { continuation in
+            continuation.yield(_state)
+            stateContinuations.append(continuation)
+        }
+    }
+#endif
 
     /// Initializes and readies a new listener
     ///

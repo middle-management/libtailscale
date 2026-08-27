@@ -2,11 +2,23 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+#if canImport(Combine)
 import Combine
+#endif
 import libtailscale
 
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+
+#endif
+
 /// ConnectionState indicates the state of individual TSConnection instances
-public enum ConnectionState {
+public enum ConnectionState: Sendable {
     case idle           ///< Reads and writes are not possible.  Connections will transition to connected automatically
     case connected      ///< Connected and ready to read/write
     case closed         ///< Closed and ready to be disposed of.  Closed connections cannot be reconnected.
@@ -14,7 +26,7 @@ public enum ConnectionState {
 }
 
 /// ListenerState indicates the state of individual TSListener instances
-public enum ListenerState {
+public enum ListenerState: Sendable {
     case idle           ///< Waiting.
     case listening      ///< Listening
     case closed         ///< Closed and ready to be disposed of.

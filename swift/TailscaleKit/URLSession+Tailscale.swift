@@ -1,6 +1,10 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+// The SOCKS ProxyConfiguration below is Network.framework-only. On other
+// platforms LocalAPIClient talks to the loopback listener directly (plain
+// HTTP + header auth), so this whole extension is Apple-only.
+#if canImport(Network)
 import Foundation
 #if os(iOS)
 import UIKit
@@ -40,3 +44,4 @@ public extension URLSessionConfiguration {
         return (session, config)
     }
 }
+#endif  // canImport(Network)
