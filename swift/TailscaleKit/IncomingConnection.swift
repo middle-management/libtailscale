@@ -3,6 +3,7 @@
 
 import Combine
 import Foundation
+import libtailscale
 
 /// IncomingConnection is use to read incoming message from an inbound
 /// connection.   IncomingConnections are not instantiated directly,
@@ -62,6 +63,27 @@ public actor IncomingConnection {
         }
 
         return try await reader.readAll(timeout: timeout)
+    }
+
+    /// Sends the given data to the connection.
+    /// Loops until every byte is written or an error is returned.
+    public func send(_ data: Data) throws {
+        guard _state == .connected else {
+            throw TailscaleError.connectionClosed
+        }
+
+        try data.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
+            guard var ptr = buffer.baseAddress else { return }
+            var remaining = buffer.count
+            while remaining > 0 {
+                let written = Darwin.write(conn, ptr, remaining)
+                if written <= 0 {
+                    throw TailscaleError.shortWrite
+                }
+                remaining -= written
+                ptr = ptr.advanced(by: written)
+            }
+        }
     }
 }
 
