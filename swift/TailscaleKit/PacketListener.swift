@@ -26,6 +26,11 @@ public actor PacketListener {
     private var listener: TailscaleListener = 0
     private var address: String
     private let logger: LogSink?
+    /// How to release the fd. tsnet packet listeners must go through
+    /// tailscale_listen_packet_close (which synchronously releases the
+    /// netstack port binding); adopted guest fds are plain socketpair ends
+    /// whose Go pumps tear down when this side closes.
+    private let closesViaPacketClose: Bool
 
     /// Maximum bytes one datagram on the wire can carry. A UDP datagram is
     /// capped at 64KB; we add room for the address prefix on top. Used as
@@ -42,6 +47,7 @@ public actor PacketListener {
         self.logger = logger
         self.tailscale = tailscale
         self.address = address
+        self.closesViaPacketClose = true
 
         let res = tailscale_listen_packet(tailscale, "udp", address, &listener)
         guard res == 0 else {
@@ -53,13 +59,33 @@ public actor PacketListener {
         logger?.log("PacketListener bound on udp \(address)")
     }
 
+    /// Adopts an already-open framed-datagram fd — a guest node's UDP
+    /// listener or dial (see guest_server_listen_packet /
+    /// guest_client_dial_udp in tailscale.h), which speak exactly this
+    /// listener's framing. `handle` is only consulted for error messages.
+    internal init(adopting fd: TailscaleListener,
+                  handle: TailscaleHandle,
+                  address: String,
+                  logger: LogSink? = nil) {
+        self.logger = logger
+        self.tailscale = handle
+        self.address = address
+        self.listener = fd
+        self.closesViaPacketClose = false
+        logger?.log("PacketListener adopted fd \(fd) (\(address))")
+    }
+
     deinit {
         if listener != 0 {
-            // tailscale_listen_packet_close closes both ends of the socketpair
-            // and calls pc.Close() on the Go side, releasing the netstack port
-            // binding synchronously. Do NOT also call Darwin.close(listener) —
-            // the Go side already closed that fd.
-            tailscale_listen_packet_close(listener)
+            if closesViaPacketClose {
+                // tailscale_listen_packet_close closes both ends of the
+                // socketpair and calls pc.Close() on the Go side, releasing
+                // the netstack port binding synchronously. Do NOT also call
+                // Darwin.close(listener) — the Go side already closed that fd.
+                tailscale_listen_packet_close(listener)
+            } else {
+                Darwin.close(listener)
+            }
         }
     }
 
@@ -72,7 +98,11 @@ public actor PacketListener {
     /// the Go side already closed both ends of the socketpair.
     public func close() {
         if listener != 0 {
-            tailscale_listen_packet_close(listener)
+            if closesViaPacketClose {
+                tailscale_listen_packet_close(listener)
+            } else {
+                Darwin.close(listener)
+            }
             listener = 0
         }
     }

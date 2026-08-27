@@ -43,7 +43,18 @@ extension TailscaleHandle {
             buf.deallocate()
 
         }
-        let res = tailscale_errmsg(self, buf, 256)
+        // Guest handles live in their own ranges (guest_server: 47<<16…,
+        // guest_client: 53<<16…, tsnet: 42<<16…), so one helper serves all
+        // three families and every wrapper is guest-aware for free.
+        let res: Int32
+        switch self {
+        case (47 << 16)...(47 << 16 + 0xFFFF):
+            res = guest_server_errmsg(self, buf, 256)
+        case (53 << 16)...(53 << 16 + 0xFFFF):
+            res = guest_client_errmsg(self, buf, 256)
+        default:
+            res = tailscale_errmsg(self, buf, 256)
+        }
         if res != 0 {
             switch res {
             case EBADF:
