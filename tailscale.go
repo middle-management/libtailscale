@@ -8,6 +8,7 @@ package main
 import "C"
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -285,7 +286,17 @@ func TsnetListen(sd C.int, network, addr *C.char, listenerOut *C.int) C.int {
 				continue
 			}
 			rights := syscall.UnixRights(int(connFd))
-			err = syscall.Sendmsg(sp, nil, rights, nil, 0)
+			// Carry the remote address inband alongside the SCM_RIGHTS fd so
+			// the consumer (TsnetAccept) can key it by the fd number it
+			// actually receives. Keying the lookup table by connFd here is
+			// wrong: SCM_RIGHTS hands the receiver a *fresh* fd number (a dup
+			// of the same open file description), so a later
+			// tailscale_getremoteaddr(receivedFd) misses the connFd-keyed
+			// entry and returns EBADF non-deterministically. A fixed-size
+			// field keeps the stream-socket framing aligned per accepted fd.
+			var addrBuf [256]byte
+			copy(addrBuf[:255], netConn.RemoteAddr().String())
+			err = syscall.Sendmsg(sp, addrBuf[:], rights, nil, 0)
 			if err != nil {
 				// We handle sp being closed in the read goroutine above.
 				if s.s.Logf != nil {
@@ -294,11 +305,6 @@ func TsnetListen(sd C.int, network, addr *C.char, listenerOut *C.int) C.int {
 				netConn.Close()
 				// fallthrough to close connFd, then continue Accept()ing
 			}
-
-			// map the connection to the remote address
-			listener.mu.Lock()
-			listener.m[connFd] = netConn.RemoteAddr()
-			listener.mu.Unlock()
 
 			syscall.Close(int(connFd)) // now owned by recvmsg
 		}
@@ -319,7 +325,10 @@ func TsnetAccept(listenerFd C.int, connOut *C.int) C.int {
 	}
 
 	buf := make([]byte, unix.CmsgLen(int(unsafe.Sizeof((C.int)(0)))))
-	_, oobn, _, _, err := syscall.Recvmsg(int(listenerFd), nil, buf, 0)
+	// The accept goroutine sends the connection's remote address inband as a
+	// fixed 256-byte field alongside the SCM_RIGHTS fd (see the sender side).
+	addrBuf := make([]byte, 256)
+	n, oobn, _, _, err := syscall.Recvmsg(int(listenerFd), addrBuf, buf, 0)
 	if err != nil {
 		return ln.s.recErr(err)
 	}
@@ -340,8 +349,29 @@ func TsnetAccept(listenerFd C.int, connOut *C.int) C.int {
 	}
 	*connOut = (C.int)(fds[0])
 
+	// Key the remote-address table by the fd we just handed C — the same fd
+	// it will pass back to tailscale_getremoteaddr. (See the sender side in
+	// the accept goroutine for why connFd can't be used as the key.)
+	if n > 0 {
+		if i := bytes.IndexByte(addrBuf[:n], 0); i >= 0 {
+			n = i
+		}
+		ln.mu.Lock()
+		ln.m[*connOut] = stringAddr(addrBuf[:n])
+		ln.mu.Unlock()
+	}
+
 	return 0
 }
+
+// stringAddr is a net.Addr that carries only a pre-resolved address string.
+// It shuttles a connection's remote address from the accept goroutine to the
+// consumer (TsnetAccept) without depending on fd-number identity across the
+// SCM_RIGHTS handoff.
+type stringAddr string
+
+func (a stringAddr) Network() string { return "tcp" }
+func (a stringAddr) String() string  { return string(a) }
 
 func newConn(s *server, netConn net.Conn, connOut *C.int) error {
 	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
