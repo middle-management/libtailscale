@@ -85,7 +85,12 @@ public actor Listener {
 
         var p: pollfd = .init(fd: listener, events: Int16(POLLIN), revents: 0)
         let ret = poll(&p, 1, Int32(timeout * 1000))
-        guard ret > 0 else {
+        if ret == 0 {
+            // Plain poll timeout. The listener is still fine; let the caller
+            // decide whether to retry. Don't close it — that's a fatal path.
+            throw TailscaleError.readFailed
+        }
+        if ret < 0 {
             close()
             throw TailscaleError.fromPosixErrCode(errno, "Poll failed")
         }
