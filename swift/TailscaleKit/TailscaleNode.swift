@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 import Foundation
+import libtailscale
 
 public let kDefaultControlURL = "https://controlplane.tailscale.com"
 
