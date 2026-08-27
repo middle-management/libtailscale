@@ -634,6 +634,25 @@ func GuestClientDialUDP(cd C.int, port C.ushort, fdOut *C.int) C.int {
 	return 0
 }
 
+// GuestClientServerAddr writes the server's tunnel address (the bare IP,
+// no port) into buf — the address inbound datagram frames on this
+// client's flows will carry as their source, derived from the token's
+// embedded server key. Valid immediately after GuestClientNew; no
+// network is touched.
+//
+//export GuestClientServerAddr
+func GuestClientServerAddr(cd C.int, buf *C.char, buflen C.size_t) C.int {
+	c := getGuestClient(cd)
+	if c == nil {
+		return C.EBADF
+	}
+	ci, err := guest.ParseConnBlob(c.gc.Server)
+	if err != nil {
+		return c.errSink.recErr(fmt.Errorf("guest: bad token: %w", err))
+	}
+	return copyCString(guest.AddrForKey(ci.ServerPublic.NodePublic).String(), buf, buflen, c.errSink)
+}
+
 //export GuestClientErrmsg
 func GuestClientErrmsg(cd C.int, buf *C.char, buflen C.size_t) C.int {
 	c := getGuestClient(cd)

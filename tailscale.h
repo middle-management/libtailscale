@@ -325,6 +325,11 @@ extern int guest_client_dial(guest_client cd, unsigned short port, tailscale_con
 // are ignored — the flow has exactly one peer).
 extern int guest_client_dial_udp(guest_client cd, unsigned short port, tailscale_listener* fd_out);
 
+// guest_client_server_addr writes the server's tunnel address (bare IP,
+// NUL-terminated, no port) into buf — the source address this client's
+// inbound datagram frames carry. Valid immediately after guest_client_new.
+extern int guest_client_server_addr(guest_client cd, char* buf, size_t buflen);
+
 // guest_client_errmsg writes the details of the last error to buf, with
 // tailscale_errmsg's semantics.
 extern int guest_client_errmsg(guest_client cd, char* buf, size_t buflen);
