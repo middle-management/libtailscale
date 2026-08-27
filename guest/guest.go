@@ -1869,8 +1869,13 @@ func (c *Client) Ping(ctx context.Context) (PingResult, error) {
 	return res, err
 }
 
-// ping sends a single meow ping and waits for the meowed ack. The
-// client must be started.
+// ping sends a meow ping and waits for the meowed ack, retransmitting
+// once a second until it lands or the deadline expires. The retransmit
+// is load-bearing, not paranoia: DERP delivers only to keys connected
+// at that instant — a meow that arrives while the server's relay
+// subscription is still settling is dropped, not queued. Resends are
+// idempotent on both ends (onMeow re-acks known clients; the client's
+// onMeowed is a sync.OnceFunc). The client must be started.
 func (c *Client) ping(ctx context.Context) (PingResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -1891,11 +1896,17 @@ func (c *Client) ping(ctx context.Context) (PingResult, error) {
 		return zero, fmt.Errorf("meow not sent")
 	}
 
-	select {
-	case <-c.meowWait:
-		return PingResult{time.Since(t0)}, nil
-	case <-ctx.Done():
-		return zero, ctx.Err()
+	resend := time.NewTicker(time.Second)
+	defer resend.Stop()
+	for {
+		select {
+		case <-c.meowWait:
+			return PingResult{time.Since(t0)}, nil
+		case <-resend.C:
+			mc.SendDERPPacketTo(dstNode, derpRegion, pkt)
+		case <-ctx.Done():
+			return zero, ctx.Err()
+		}
 	}
 }
 
