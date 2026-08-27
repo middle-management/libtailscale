@@ -11,7 +11,9 @@ import CGoRuntimeInit
 func ts_go_runtime_start() {}
 #endif
 import Foundation
+#if canImport(libtailscale)
 import libtailscale
+#endif
 
 public let kDefaultControlURL = "https://controlplane.tailscale.com"
 

@@ -8,7 +8,9 @@ import Glibc
 
 #endif
 import Foundation
+#if canImport(libtailscale)
 import libtailscale
+#endif
 
 /// PacketListener is the UDP equivalent of `Listener`. There is no accept():
 /// every datagram from every source arrives on the same fd. Demultiplex by

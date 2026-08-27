@@ -11,7 +11,9 @@ import Glibc
 import CGoRuntimeInit
 #endif
 import Foundation
+#if canImport(libtailscale)
 import libtailscale
+#endif
 
 /// Guest nodes: control-plane-free tunnels addressed by a connection
 /// token instead of a tailnet (see "guest nodes" in tailscale.h and the

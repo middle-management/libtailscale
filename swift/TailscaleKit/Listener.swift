@@ -5,7 +5,9 @@
 import Combine
 #endif
 import Foundation
+#if canImport(libtailscale)
 import libtailscale
+#endif
 
 #if canImport(Darwin)
 import Darwin

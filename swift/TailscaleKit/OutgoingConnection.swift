@@ -8,7 +8,9 @@ import FoundationNetworking
 #if canImport(Combine)
 import Combine
 #endif
+#if canImport(libtailscale)
 import libtailscale
+#endif
 
 #if canImport(Darwin)
 import Darwin

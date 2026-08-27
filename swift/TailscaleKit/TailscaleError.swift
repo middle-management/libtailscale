@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 import Foundation
+#if canImport(libtailscale)
 import libtailscale
+#endif
 
 public enum TailscaleError: Error {
     case badInterfaceHandle     ///< The tailscale handle is bad.
