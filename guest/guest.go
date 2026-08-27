@@ -234,6 +234,19 @@ type locoBackend struct {
 
 	mu             sync.Mutex
 	clients        map[key.NodePublic]*tailcfg.Node // for the server
+	// deniedClients holds evicted node keys (see [Server.RemoveClient]):
+	// their meows are silently ignored, exactly like an allowlist miss.
+	// Local addition; upstream tailcat has no removal at all.
+	deniedClients map[key.NodePublic]bool
+	// nextClientID allocates node IDs monotonically. Upstream derived IDs
+	// from len(clients)+2, which would collide after a removal.
+	nextClientID tailcfg.NodeID
+	// flows tracks the live TCP/UDP flow conns per client address, so
+	// RemoveClient can close them: gVisor consults the flow handlers only
+	// for NEW flows, and the WireGuard session itself outlives the netmap
+	// removal until rekey — without this, an evicted peer's established
+	// RTP flow would keep flowing. Local addition.
+	flows map[netip.Addr]map[io.Closer]bool
 	nm             *netmap.NetworkMap
 	allowedClients map[key.NodePublic]bool // or nil map for all
 	eps            []netip.AddrPort        // our current local UDP endpoints, sorted
@@ -462,11 +475,23 @@ func (s *Server) Start() error {
 	ns.ProcessLocalIPs = true
 	ns.ProcessSubnets = true
 	ns.GetTCPHandlerForFlow = func(src, dst netip.AddrPort) (handler func(net.Conn), intercept bool) {
+		if !lb.isActiveClientAddr(src.Addr()) {
+			return nil, true // evicted peer's session, pre-rekey: RST
+		}
 		if dst.Addr() == lb.addr {
 			if s.OnTCP == nil {
 				return nil, true // send RST
 			}
-			return s.OnTCP(dst.Port()), true
+			h := s.OnTCP(dst.Port())
+			if h == nil {
+				return nil, true
+			}
+			srcAddr := src.Addr()
+			return func(c net.Conn) {
+				lb.trackFlow(srcAddr, c)
+				defer lb.untrackFlow(srcAddr, c)
+				h(c)
+			}, true
 		}
 		if s.OnTCPForward == nil {
 			return nil, true // send RST
@@ -483,8 +508,20 @@ func (s *Server) Start() error {
 	// like OnTCP. No UDP forward/exit-node counterpart — reject anything
 	// not addressed to us.
 	ns.GetUDPHandlerForFlow = func(src, dst netip.AddrPort) (handler func(nettype.ConnPacketConn), intercept bool) {
+		if !lb.isActiveClientAddr(src.Addr()) {
+			return nil, true // evicted peer's session, pre-rekey: drop
+		}
 		if dst.Addr() == lb.addr && s.OnUDP != nil {
-			return s.OnUDP(dst.Port()), true
+			h := s.OnUDP(dst.Port())
+			if h == nil {
+				return nil, true
+			}
+			srcAddr := src.Addr()
+			return func(c nettype.ConnPacketConn) {
+				lb.trackFlow(srcAddr, c)
+				defer lb.untrackFlow(srcAddr, c)
+				h(c)
+			}, true
 		}
 		return nil, true // reject
 	}
@@ -639,6 +676,50 @@ func (s *Server) AddAllowedClient(k key.NodePublic) {
 	s.lb.mu.Lock()
 	defer s.lb.mu.Unlock()
 	mak.Set(&s.lb.allowedClients, k, true)
+}
+
+// RemoveClient evicts client k: it is deleted from the client set and
+// the netmap, every live TCP/UDP flow from it is closed, and its key
+// joins a denylist so a fresh meow handshake is silently ignored —
+// re-admission requires a new Server (in Tailscreen terms, a new share
+// and a new token). Removing an unknown key only denylists it.
+//
+// The eviction is complete at this layer even though the peer's
+// WireGuard session survives until rekey: new flows are refused by the
+// flow handlers (isActiveClientAddr), existing flows are closed here,
+// and outbound routing to the peer's address fails once the netmap no
+// longer carries it. A denylisted key beats AllowedClients.
+//
+// Local addition; upstream tailcat's client set is append-only.
+func (s *Server) RemoveClient(k key.NodePublic) {
+	lb := s.lb
+	if lb == nil {
+		return // never started; nothing to evict
+	}
+	addr := tcAddrForKey(k)
+
+	lb.mu.Lock()
+	mak.Set(&lb.deniedClients, k, true)
+	_, present := lb.clients[k]
+	if present {
+		delete(lb.clients, k)
+		lb.rebuildNetmapLocked(lb.derpRegionID())
+	}
+	// Snapshot the flow conns to close outside the lock: Close can
+	// synchronously unblock a handler that immediately calls
+	// untrackFlow, which takes lb.mu.
+	var conns []io.Closer
+	for c := range lb.flows[addr] {
+		conns = append(conns, c)
+	}
+	lb.mu.Unlock()
+
+	for _, c := range conns {
+		c.Close()
+	}
+	if present {
+		lb.logf("evicted client %v", k.ShortString())
+	}
 }
 
 // ConnBlob returns the token that clients use to connect to this
@@ -1072,6 +1153,46 @@ func (b *locoBackend) peerAllowedIPs(k key.NodePublic) (allowedIPs []netip.Prefi
 	return n.AllowedIPs, true
 }
 
+// trackFlow registers a live flow conn for addr so RemoveClient can
+// close it; untrackFlow drops it when its handler returns.
+func (b *locoBackend) trackFlow(addr netip.Addr, c io.Closer) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	m, ok := b.flows[addr]
+	if !ok {
+		m = make(map[io.Closer]bool)
+		mak.Set(&b.flows, addr, m)
+	}
+	m[c] = true
+}
+
+func (b *locoBackend) untrackFlow(addr netip.Addr, c io.Closer) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if m, ok := b.flows[addr]; ok {
+		delete(m, c)
+		if len(m) == 0 {
+			delete(b.flows, addr)
+		}
+	}
+}
+
+// isActiveClientAddr reports whether addr is the derived address of a
+// currently-admitted client. Flow handlers consult it so an evicted
+// peer's WireGuard session (alive until rekey) can no longer open new
+// flows. For a never-evicted peer this is always true: only meow-admitted
+// clients have sessions at all.
+func (b *locoBackend) isActiveClientAddr(addr netip.Addr) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for k := range b.clients {
+		if tcAddrForKey(k) == addr {
+			return true
+		}
+	}
+	return false
+}
+
 // peerByIP returns the public key of the peer that outbound packets
 // addressed to dst should be sent to (see
 // [wgengine.Engine.SetPeerByIPPacketFunc]).
@@ -1301,6 +1422,12 @@ func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.logf("got meow from %v", src.String())
+	if b.deniedClients[src] {
+		// Evicted (see [Server.RemoveClient]): same silence as an
+		// allowlist miss — no meowed ack, nothing learnable.
+		b.logf("ignoring meow from %v: evicted", src.String())
+		return false
+	}
 	if b.allowedClients != nil && !b.allowedClients[src] {
 		b.logf("ignoring meow from %v: not in allowedClients", src.String())
 		return false
@@ -1309,10 +1436,16 @@ func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool 
 	if _, ok := b.clients[src]; ok {
 		return true
 	}
-	id := len(b.clients) + 2 // server is ID 1, clients are IDs 2, 3, ...
+	// Monotonic, never reused: len(clients)+2 (upstream) would hand a
+	// later client an evicted client's ID. Server is ID 1.
+	if b.nextClientID < 2 {
+		b.nextClientID = 2
+	}
+	id := b.nextClientID
+	b.nextClientID++
 	derpRegion := b.derpRegionID()
 	mak.Set(&b.clients, src, &tailcfg.Node{
-		ID:         tailcfg.NodeID(id),
+		ID:         id,
 		StableID:   tailcfg.StableNodeID(fmt.Sprint(id)),
 		Name:       fmt.Sprintf("client%d.tailcat.", id),
 		User:       100,
@@ -1323,6 +1456,22 @@ func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool 
 		HomeDERP:   derpRegion,
 	})
 
+	b.rebuildNetmapLocked(derpRegion)
+
+	// No engine reconfig needed: the WireGuard device learns about the
+	// new peer lazily via the config source installed with
+	// SetPeerConfigFunc when the client's handshake arrives.
+
+	// Tell the new client our UDP endpoints so both sides can attempt
+	// a direct path. Async because advertiseEndpoints takes b.mu.
+	go b.advertiseEndpoints()
+	return true
+}
+
+// rebuildNetmapLocked rebuilds the netmap from the current client set and
+// pushes it to magicsock and netstack. b.mu must be held. Extracted from
+// onMeow so RemoveClient can reuse it.
+func (b *locoBackend) rebuildNetmapLocked(derpRegion int) {
 	nm := &netmap.NetworkMap{
 		NodeKey: b.pub,
 		SelfNode: (&tailcfg.Node{
@@ -1348,15 +1497,6 @@ func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool 
 	mc := b.sys.MagicSock.Get()
 	mc.SetNetworkMap(nm.SelfNode, nm.Peers)
 	b.sys.Netstack.Get().UpdateNetstackIPs(nm)
-
-	// No engine reconfig needed: the WireGuard device learns about the
-	// new peer lazily via the config source installed with
-	// SetPeerConfigFunc when the client's handshake arrives.
-
-	// Tell the new client our UDP endpoints so both sides can attempt
-	// a direct path. Async because advertiseEndpoints takes b.mu.
-	go b.advertiseEndpoints()
-	return true
 }
 
 func (b *locoBackend) Status() *ipnstate.Status {
