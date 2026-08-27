@@ -222,7 +222,18 @@ func TsnetListen(sd C.int, network, addr *C.char, listenerOut *C.int) C.int {
 		return s.recErr(err)
 	}
 	s.started = true
+	return bridgeListen(s, ln, listenerOut)
+}
 
+// bridgeListen wires an already-open net.Listener to a C-consumable
+// listener fd: the accept pump, the SCM_RIGHTS (or Windows record)
+// handoff, and the teardown-on-close plumbing. Factored out of
+// TsnetListen so the guest (control-plane-free) surface can serve its
+// callback-delivered connections through the exact same machinery —
+// including tailscale_accept and tailscale_getremoteaddr on the C side.
+// s is only used for error recording and logging; its tsnet server may
+// be nil (the guest surface passes a bare error-sink server).
+func bridgeListen(s *server, ln net.Listener, listenerOut *C.int) C.int {
 	// The tailscale_listener we return to C is one side of a bridge socket
 	// pair (socketpair(2) on Unix, a loopback pair on Windows).
 	// We do this so we can proactively call ln.Accept in a goroutine and
@@ -279,7 +290,7 @@ func TsnetListen(sd C.int, network, addr *C.char, listenerOut *C.int) C.int {
 			}
 			var connFd C.int
 			if err := newConn(s, netConn, &connFd); err != nil {
-				if s.s.Logf != nil {
+				if s.s != nil && s.s.Logf != nil {
 					s.s.Logf("libtailscale.accept: newConn: %v", err)
 				}
 				netConn.Close()
@@ -297,7 +308,7 @@ func TsnetListen(sd C.int, network, addr *C.char, listenerOut *C.int) C.int {
 			copy(addrBuf[:255], netConn.RemoteAddr().String())
 			if err := sp.sendConn(connFd, addrBuf[:]); err != nil {
 				// We handle sp being closed in the read goroutine above.
-				if s.s.Logf != nil {
+				if s.s != nil && s.s.Logf != nil {
 					s.s.Logf("libtailscale.accept: sendConn failed: %v", err)
 				}
 				netConn.Close()

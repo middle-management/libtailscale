@@ -722,6 +722,38 @@ func (s *Server) RemoveClient(k key.NodePublic) {
 	}
 }
 
+// Clients returns the node public keys of the currently-admitted
+// clients, in admission order (by node ID). Local addition: the C/Swift
+// surface reads this to show and evict individual viewers.
+func (s *Server) Clients() []key.NodePublic {
+	lb := s.lb
+	if lb == nil {
+		return nil
+	}
+	lb.mu.Lock()
+	defer lb.mu.Unlock()
+	type kid struct {
+		k  key.NodePublic
+		id tailcfg.NodeID
+	}
+	kids := make([]kid, 0, len(lb.clients))
+	for k, n := range lb.clients {
+		kids = append(kids, kid{k, n.ID})
+	}
+	slices.SortFunc(kids, func(a, b kid) int { return cmp.Compare(a.id, b.id) })
+	out := make([]key.NodePublic, len(kids))
+	for i, e := range kids {
+		out[i] = e.k
+	}
+	return out
+}
+
+// AddrForKey returns the tunnel address derived from a node public key —
+// the source address a client's flows carry, and the address a server is
+// dialed at. Exported for the C/Swift surface, which maps flow addresses
+// back to client identities with it. Local addition.
+func AddrForKey(k key.NodePublic) netip.Addr { return tcAddrForKey(k) }
+
 // ConnBlob returns the token that clients use to connect to this
 // server. It embeds the full DERP region, so clients don't need to
 // fetch the DERP map from the network. It must only be called after

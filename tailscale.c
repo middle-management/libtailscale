@@ -34,6 +34,22 @@ extern int TsnetListenPacket(int sd, char* net, char* addr, int* listenerOut);
 extern int TsnetListenPacketClose(int fd);
 extern int TsnetLoopback(int sd, char* addrOut, size_t addrLen, char* proxyOut, char* localOut);
 extern int TsnetEnableFunnelToLocalhostPlaintextHttp1(int sd, int localhostPort);
+extern int GuestServerNew();
+extern int GuestServerSetDERPMapURL(int gd, char* url);
+extern int GuestServerSetDERPMapJSON(int gd, char* dmJSON);
+extern int GuestServerStart(int gd);
+extern int GuestServerToken(int gd, char* buf, size_t buflen);
+extern int GuestServerListenPacket(int gd, unsigned short port, int* fdOut);
+extern int GuestServerListen(int gd, unsigned short port, int* listenerOut);
+extern int GuestServerPeers(int gd, char* buf, size_t buflen);
+extern int GuestServerRemovePeer(int gd, char* nodeKey);
+extern int GuestServerErrmsg(int gd, char* buf, size_t buflen);
+extern int GuestServerClose(int gd);
+extern int GuestClientNew(char* token);
+extern int GuestClientDial(int cd, unsigned short port, int* connOut);
+extern int GuestClientDialUDP(int cd, unsigned short port, int* fdOut);
+extern int GuestClientErrmsg(int cd, char* buf, size_t buflen);
+extern int GuestClientClose(int cd);
 
 tailscale tailscale_new() {
 	return TsnetNewServer();
@@ -108,4 +124,53 @@ int tailscale_errmsg(tailscale sd, char* buf, size_t buflen) {
 
 int tailscale_enable_funnel_to_localhost_plaintext_http1(tailscale sd, int localhostPort) {
 	return TsnetEnableFunnelToLocalhostPlaintextHttp1(sd, localhostPort);
+}
+
+guest_server guest_server_new() {
+	return GuestServerNew();
+}
+int guest_server_set_derpmap_url(guest_server gd, const char* url) {
+	return GuestServerSetDERPMapURL(gd, (char*)url);
+}
+int guest_server_set_derpmap_json(guest_server gd, const char* dm_json) {
+	return GuestServerSetDERPMapJSON(gd, (char*)dm_json);
+}
+int guest_server_start(guest_server gd) {
+	return GuestServerStart(gd);
+}
+int guest_server_token(guest_server gd, char* buf, size_t buflen) {
+	return GuestServerToken(gd, buf, buflen);
+}
+int guest_server_listen_packet(guest_server gd, unsigned short port, tailscale_listener* fd_out) {
+	return GuestServerListenPacket(gd, port, fd_out);
+}
+int guest_server_listen(guest_server gd, unsigned short port, tailscale_listener* listener_out) {
+	return GuestServerListen(gd, port, listener_out);
+}
+int guest_server_peers(guest_server gd, char* buf, size_t buflen) {
+	return GuestServerPeers(gd, buf, buflen);
+}
+int guest_server_remove_peer(guest_server gd, const char* node_key) {
+	return GuestServerRemovePeer(gd, (char*)node_key);
+}
+int guest_server_errmsg(guest_server gd, char* buf, size_t buflen) {
+	return GuestServerErrmsg(gd, buf, buflen);
+}
+int guest_server_close(guest_server gd) {
+	return GuestServerClose(gd);
+}
+guest_client guest_client_new(const char* token) {
+	return GuestClientNew((char*)token);
+}
+int guest_client_dial(guest_client cd, unsigned short port, tailscale_conn* conn_out) {
+	return GuestClientDial(cd, port, conn_out);
+}
+int guest_client_dial_udp(guest_client cd, unsigned short port, tailscale_listener* fd_out) {
+	return GuestClientDialUDP(cd, port, fd_out);
+}
+int guest_client_errmsg(guest_client cd, char* buf, size_t buflen) {
+	return GuestClientErrmsg(cd, buf, buflen);
+}
+int guest_client_close(guest_client cd) {
+	return GuestClientClose(cd);
 }
