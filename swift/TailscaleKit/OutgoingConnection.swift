@@ -47,6 +47,10 @@ public actor OutgoingConnection {
     private var address: String
     private var conn: TailscaleConnection = 0
 
+    /// Owns the blocking poll+read so `receive` does NOT run it under this
+    /// actor's isolation. See `receive` for why that matters.
+    private var reader: OutgoingSocketReader?
+
     private let logger: LogSink
 
     /// The state of the connection.  Listen for transitions to determine
@@ -87,6 +91,7 @@ public actor OutgoingConnection {
         }
 
         self.state = .connected
+        self.reader = OutgoingSocketReader(conn: conn)
     }
 
     deinit {
@@ -103,6 +108,7 @@ public actor OutgoingConnection {
             Darwin.close(conn)
             conn = 0
         }
+        reader = nil
         state = .closed
     }
 
@@ -131,11 +137,42 @@ public actor OutgoingConnection {
 
     /// Returns up to `maximumLength` bytes from the connection. Blocks until data is
     /// available or `timeout` (ms) elapses.
+    ///
+    /// The poll+read runs on a SEPARATE actor (`OutgoingSocketReader`) rather
+    /// than inline here, and that is the whole point of this method's shape.
+    /// `poll(2)` blocks for the full timeout when the peer is quiet, and a
+    /// receive loop typically passes a multi-second timeout. Running it under
+    /// *this* actor's isolation holds the connection's executor for that whole
+    /// interval, so every concurrent `send` on the same connection queues
+    /// behind it — a caller that reads on one task and writes on another (the
+    /// normal shape of a duplex control channel) sees its writes delayed by up
+    /// to one poll interval. Awaiting a second actor suspends `receive` and
+    /// releases this one, so sends interleave with a blocked read.
+    ///
+    /// Mirrors `IncomingConnection`, which already separates its reader for
+    /// the same reason.
     public func receive(maximumLength: Int = 65536, timeout: Int32) async throws -> Data {
-        guard state == .connected else {
+        guard state == .connected, let reader else {
             throw TailscaleError.connectionClosed
         }
 
+        return try await reader.read(maximumLength: maximumLength, timeout: timeout)
+    }
+}
+
+/// Serializes reads on an `OutgoingConnection`, off the connection actor.
+///
+/// Holds the fd by value: a `close()` on the connection makes the next
+/// `poll`/`read` here fail, which surfaces as `readFailed` and unwinds the
+/// caller's receive loop — the same teardown path a peer disconnect takes.
+private actor OutgoingSocketReader {
+    private let conn: TailscaleConnection
+
+    init(conn: TailscaleConnection) {
+        self.conn = conn
+    }
+
+    func read(maximumLength: Int, timeout: Int32) throws -> Data {
         var p: pollfd = .init(fd: conn, events: Int16(POLLIN), revents: 0)
         let res = poll(&p, 1, timeout)
         guard res > 0 else {
