@@ -108,4 +108,25 @@ public actor OutgoingConnection {
             throw TailscaleError.shortWrite
         }
     }
+
+    /// Returns up to `maximumLength` bytes from the connection. Blocks until data is
+    /// available or `timeout` (ms) elapses.
+    public func receive(maximumLength: Int = 65536, timeout: Int32) async throws -> Data {
+        guard state == .connected else {
+            throw TailscaleError.connectionClosed
+        }
+
+        var p: pollfd = .init(fd: conn, events: Int16(POLLIN), revents: 0)
+        let res = poll(&p, 1, timeout)
+        guard res > 0 else {
+            throw TailscaleError.readFailed
+        }
+
+        var buffer = [UInt8](repeating: 0, count: maximumLength)
+        let bytesRead = buffer.withUnsafeMutableBufferPointer { Darwin.read(conn, $0.baseAddress, maximumLength) }
+        if bytesRead <= 0 {
+            throw TailscaleError.readFailed
+        }
+        return Data(buffer[0..<bytesRead])
+    }
 }
