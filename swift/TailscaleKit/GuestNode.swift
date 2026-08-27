@@ -7,7 +7,9 @@ import Darwin
 import Glibc
 
 #endif
+#if canImport(CGoRuntimeInit)
 import CGoRuntimeInit
+#endif
 import Foundation
 import libtailscale
 

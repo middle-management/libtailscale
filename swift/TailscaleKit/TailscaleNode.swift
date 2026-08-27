@@ -1,7 +1,15 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+#if canImport(CGoRuntimeInit)
 import CGoRuntimeInit
+#else
+// CGoRuntimeInit is a Windows-only Go-runtime bootstrap supplied by the
+// consuming SwiftPM package (Tailscreen's Packages/TailscaleKit); on every
+// other platform the C function is empty. Builds without that module —
+// this repo's own Xcode project — get the same no-op.
+func ts_go_runtime_start() {}
+#endif
 import Foundation
 import libtailscale
 
