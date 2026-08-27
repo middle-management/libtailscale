@@ -106,18 +106,26 @@ public actor OutgoingConnection {
         state = .closed
     }
 
-    /// Sends the given data to the connection
-    ///
-    /// @throws TailscaleError on failure
+    /// Sends the given data to the connection.
+    /// Loops until every byte is written or an error is returned — a single
+    /// write(2) may legitimately be short (socketpair buffers are a few KB),
+    /// which is not a failure. Mirrors IncomingConnection.send.
     public func send(_ data: Data) throws {
         guard state == .connected else {
             throw TailscaleError.connectionClosed
         }
 
-        let bytesWritten = Darwin.write(conn, data.withUnsafeBytes { $0.baseAddress! }, data.count)
-
-        if bytesWritten != data.count {
-            throw TailscaleError.shortWrite
+        try data.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
+            guard var ptr = buffer.baseAddress else { return }
+            var remaining = buffer.count
+            while remaining > 0 {
+                let written = Darwin.write(conn, ptr, remaining)
+                if written <= 0 {
+                    throw TailscaleError.shortWrite
+                }
+                remaining -= written
+                ptr = ptr.advanced(by: written)
+            }
         }
     }
 
