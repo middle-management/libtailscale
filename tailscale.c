@@ -24,6 +24,7 @@ extern int TsnetGetRemoteAddr(int listener, int conn, char *buf, size_t buflen);
 extern int TsnetListen(int sd, char* net, char* addr, int* listenerOut);
 extern int TsnetAccept(int ld, int* connOut);
 extern int TsnetListenPacket(int sd, char* net, char* addr, int* listenerOut);
+extern int TsnetListenPacketClose(int fd);
 extern int TsnetLoopback(int sd, char* addrOut, size_t addrLen, char* proxyOut, char* localOut);
 extern int TsnetStatusJSON(int sd, char** jsonOut);
 extern int TsnetEnableFunnelToLocalhostPlaintextHttp1(int sd, int localhostPort);
@@ -58,6 +59,10 @@ int tailscale_accept(tailscale_listener ld, tailscale_conn* conn_out) {
 
 int tailscale_listen_packet(tailscale sd, const char* network, const char* addr, tailscale_listener* listener_out) {
 	return TsnetListenPacket(sd, (char*)network, (char*)addr, (int*)listener_out);
+}
+
+int tailscale_listen_packet_close(tailscale_listener fd) {
+	return TsnetListenPacketClose(fd);
 }
 
 int tailscale_getremoteaddr(tailscale_listener l, tailscale_conn conn, char* buf, size_t buflen) {
