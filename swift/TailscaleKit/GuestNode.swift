@@ -190,6 +190,20 @@ public actor GuestClientNode {
         }
     }
 
+    /// The server's tunnel address (bare IP, no port) — the source
+    /// address inbound datagram frames on this client's flows carry,
+    /// derived from the token's embedded server key. No network touched.
+    public func serverAddr() throws -> String {
+        let cap = 256
+        let buf = UnsafeMutablePointer<Int8>.allocate(capacity: cap)
+        defer { buf.deallocate() }
+        let res = guest_client_server_addr(handle, buf, cap)
+        guard res == 0 else {
+            throw TailscaleError.fromPosixErrCode(res, handle.getErrorMessage())
+        }
+        return String(cString: buf)
+    }
+
     /// Opens a connected UDP flow to `port` on the server, as a
     /// ``PacketListener``: `recv` reports the server's tunnel address as
     /// the source, and `send(_:to:)` accepts any address (the flow has
