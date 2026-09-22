@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 let kLocalAPIPath = "/localapi/v0/"
 
@@ -41,6 +44,12 @@ public actor LocalAPIClient {
     
     let logger: LogSink?
 
+    /// The idle and total-transfer budget for a watch-ipn-bus subscription.
+    /// Finite rather than `.infinity` on purpose: swift-corelibs-foundation
+    /// converts the interval to integer milliseconds, and `Int(.infinity)`
+    /// traps. Ten years is beyond any process lifetime.
+    static let ipnBusWatchTimeout: TimeInterval = 10 * 365 * 24 * 60 * 60
+
     public init(localNode: TailscaleNode, logger: LogSink?) {
         self.node = localNode
         self.logger = logger
@@ -64,9 +73,24 @@ public actor LocalAPIClient {
     ///            wishes to unsubscribe from the event stream.
     public func watchIPNBus(mask: Ipn.NotifyWatchOpt, consumer: MessageConsumer) async throws -> MessageProcessor {
         let params = [URLQueryItem(name: "mask", value: String(mask.rawValue))]
-        let (request, sessionConfig) = try await self.basicAuthURLRequest(endpoint: .watchIPNBus,
-                                                                          method: .GET,
-                                                                          params: params)
+        let (baseRequest, sessionConfig) = try await self.basicAuthURLRequest(endpoint: .watchIPNBus,
+                                                                              method: .GET,
+                                                                              params: params)
+        var request = baseRequest
+
+        // watch-ipn-bus is a stream, not a request/response: the response body
+        // stays open for as long as the subscription lives and only carries
+        // bytes when something on the tailnet changes. URLSession's defaults
+        // are sized for the other shape — `timeoutIntervalForRequest` is 60 s
+        // of *idle* time between bytes, and `timeoutIntervalForResource` caps
+        // the whole transfer at 7 days — so on a quiet tailnet the default
+        // configuration tears the bus down after one silent minute and
+        // reports `NSURLErrorTimedOut` to the consumer. The simple LocalAPI
+        // calls (`doSimpleAPIRequest`) keep their 60 s; only the watch gets an
+        // effectively unbounded budget.
+        request.timeoutInterval = Self.ipnBusWatchTimeout
+        sessionConfig.timeoutIntervalForRequest = Self.ipnBusWatchTimeout
+        sessionConfig.timeoutIntervalForResource = Self.ipnBusWatchTimeout
 
         let messageProcessor = await MessageProcessor(consumer: consumer, logger: logger)
         messageProcessor.start(request, config: sessionConfig)
@@ -146,7 +170,7 @@ public actor LocalAPIClient {
         if let error { throw error }
     }
 
-    func logout() async throws {
+    public func logout() async throws {
         let error = await doSimpleAPIRequest(
             endpoint: .logout,
             method: .POST,
@@ -246,7 +270,16 @@ public actor LocalAPIClient {
                                      headers: [String: String]? = nil,
                                      params: [URLQueryItem]? = nil) async throws -> (URLRequest, URLSessionConfiguration) {
 
+#if canImport(Network)
         let (sessionConfig, loopbackConfig) = try await URLSessionConfiguration.tailscaleSession(node)
+#else
+        // No Network.framework ProxyConfiguration off-Apple — and LocalAPI
+        // doesn't need the SOCKS hop: the tsnet loopback listener serves
+        // LocalAPI over plain HTTP at its own address, authenticated by the
+        // Authorization/Sec-Tailscale headers set below.
+        let sessionConfig = URLSessionConfiguration.default
+        let loopbackConfig = try await node.loopback()
+#endif
 
         var endpointPath = endpoint.rawValue
         if let path {

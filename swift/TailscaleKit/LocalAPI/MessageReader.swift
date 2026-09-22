@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 
 enum MessageQueueError: Error {
     case queueCongested

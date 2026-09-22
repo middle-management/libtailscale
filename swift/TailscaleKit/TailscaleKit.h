@@ -208,6 +208,140 @@ extern int tailscale_status_json(tailscale sd, char** json_out);
 //     ERANGE - insufficient storage for buf
 extern int tailscale_errmsg(tailscale sd, char* buf, size_t buflen);
 
+// tailscale_listen_packet listens for UDP datagrams on the tailnet.
+//
+// It is the spiritual equivalent to socket(AF_INET, SOCK_DGRAM, 0) +
+// bind(2). Unlike tailscale_listen, there is no accept(): the returned
+// fd carries every datagram from every source. The caller demultiplexes
+// by the per-datagram source address.
+//
+// network is a NUL-terminated string of "udp", "udp4", or "udp6".
+// addr is a NUL-terminated string of an IP address and port (e.g.
+// "0.0.0.0:7447" or "[::]:7447"); per tsnet, the IP must be present.
+//
+// The returned fd is one half of a SOCK_DGRAM socketpair. Each datagram
+// on the wire is framed as:
+//
+//     [1 byte: addr_len N][N bytes: "ip:port"][payload]
+//
+// Reads return one such framed datagram per call (boundaries preserved
+// by SOCK_DGRAM). Writes must follow the same framing.
+//
+// Returns zero on success or -1 on error, call tailscale_errmsg for details.
+extern int tailscale_listen_packet(tailscale sd, const char* network, const char* addr, tailscale_listener* listener_out);
+
+// tailscale_listen_packet_close closes a UDP packet listener opened by
+// tailscale_listen_packet, releasing the underlying netstack port binding
+// synchronously before returning.
+//
+// Unlike calling close(2) on the listener fd directly, this function
+// coordinates with the bridge goroutines on the Go side: it closes both
+// ends of the internal socketpair and calls PacketConn.Close() on the
+// netstack connection, so the port is immediately available for a subsequent
+// tailscale_listen_packet call on the same address.
+//
+// Callers must NOT call close(2) on fd after this function returns; the
+// Go side already closed both ends of the socketpair.
+//
+// Returns:
+//   0     - success
+//   EBADF - fd is not a live tailscale_listener from tailscale_listen_packet
+extern int tailscale_listen_packet_close(tailscale_listener fd);
+
+// ---------------------------------------------------------------------------
+// Guest nodes: control-plane-free tunnels addressed by a connection token
+// (Tailscreen share-by-token; see the guest/ Go package). A guest server
+// hands out one token; any client holding it can knock. Every fd these
+// functions return behaves like its tsnet counterpart: guest listener fds
+// are consumed with tailscale_accept/tailscale_getremoteaddr, and guest
+// datagram fds speak tailscale_listen_packet's
+// [1B addr_len][addr][payload] framing.
+
+// A handle onto a guest server. Zero is never a valid handle.
+typedef int guest_server;
+
+// A handle onto a guest client. Zero is never a valid handle.
+typedef int guest_client;
+
+// guest_server_new creates a guest server with a fresh ephemeral node key.
+// The token (and therefore who can ever reach this server again) dies with
+// guest_server_close.
+extern guest_server guest_server_new();
+
+// guest_server_set_derpmap_url sets the URL the server fetches its DERP
+// map from at start, when no explicit map was pinned. Optional.
+extern int guest_server_set_derpmap_url(guest_server gd, const char* url);
+
+// guest_server_set_derpmap_json pins the bootstrap relay from a
+// tailcfg.DERPMap JSON document (its first region), instead of fetching a
+// map from the network. This is how a self-hosted relay is supplied.
+extern int guest_server_set_derpmap_json(guest_server gd, const char* dm_json);
+
+// guest_server_start connects to the DERP relay and begins accepting
+// clients. Returns 0 on success; call guest_server_errmsg on error.
+extern int guest_server_start(guest_server gd);
+
+// guest_server_token writes the NUL-terminated connection token into buf.
+// Only valid after guest_server_start.
+extern int guest_server_token(guest_server gd, char* buf, size_t buflen);
+
+// guest_server_listen_packet serves UDP flows to the given port on the
+// server's own tunnel address, multiplexed over one datagram fd with
+// tailscale_listen_packet's framing (inbound frames carry each client's
+// address; outbound frames are routed by their address). One listener per
+// port; close the fd (or the server) to release it.
+extern int guest_server_listen_packet(guest_server gd, unsigned short port, tailscale_listener* fd_out);
+
+// guest_server_listen serves TCP connections to the given port on the
+// server's own tunnel address. Consume the returned listener with
+// tailscale_accept / tailscale_getremoteaddr, exactly like a
+// tailscale_listen listener.
+extern int guest_server_listen(guest_server gd, unsigned short port, tailscale_listener* listener_out);
+
+// guest_server_peers writes a NUL-terminated JSON array of the
+// currently-admitted clients, [{"key":"nodekey:…","addr":"…"}], in
+// admission order. addr is the source address that client's flows carry.
+extern int guest_server_peers(guest_server gd, char* buf, size_t buflen);
+
+// guest_server_remove_peer evicts the client whose node public key is
+// node_key (the "key" value guest_server_peers reports): its live flows
+// are closed and the key is refused for the life of this server.
+extern int guest_server_remove_peer(guest_server gd, const char* node_key);
+
+// guest_server_errmsg writes the details of the last error to buf, with
+// tailscale_errmsg's semantics.
+extern int guest_server_errmsg(guest_server gd, char* buf, size_t buflen);
+
+// guest_server_close shuts the server down: all clients drop, all
+// listener fds die, and the token is dead forever.
+extern int guest_server_close(guest_server gd);
+
+// guest_client_new creates a client for the given connection token. The
+// tunnel comes up lazily on the first dial (DERP connect, handshake).
+extern guest_client guest_client_new(const char* token);
+
+// guest_client_dial opens a TCP connection to the given port on the
+// server. The returned fd behaves like a tailscale_dial fd.
+extern int guest_client_dial(guest_client cd, unsigned short port, tailscale_conn* conn_out);
+
+// guest_client_dial_udp opens a connected UDP flow to the given port on
+// the server, as a datagram fd with tailscale_listen_packet's framing
+// (inbound frames carry the server's address; outbound frames' addresses
+// are ignored — the flow has exactly one peer).
+extern int guest_client_dial_udp(guest_client cd, unsigned short port, tailscale_listener* fd_out);
+
+// guest_client_server_addr writes the server's tunnel address (bare IP,
+// NUL-terminated, no port) into buf — the source address this client's
+// inbound datagram frames carry. Valid immediately after guest_client_new.
+extern int guest_client_server_addr(guest_client cd, char* buf, size_t buflen);
+
+// guest_client_errmsg writes the details of the last error to buf, with
+// tailscale_errmsg's semantics.
+extern int guest_client_errmsg(guest_client cd, char* buf, size_t buflen);
+
+// guest_client_close tears the client's tunnel down.
+extern int guest_client_close(guest_client cd);
+
 
 
 #ifdef __cplusplus

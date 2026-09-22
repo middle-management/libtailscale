@@ -70,7 +70,14 @@ public struct Ipn: Sendable {
     public struct Prefs: Codable, Sendable {
         public var ControlURL: String = ""
         public var RouteAll: Bool = false
-        public var AllowSingleHosts: Bool = false
+        /// Gone from `ipn.Prefs` upstream (tailscale.com no longer emits the
+        /// key), so it has to be optional: a non-optional stored property is
+        /// a *required* key to synthesized `Decodable`, and with it required
+        /// every `Notify` carrying `Prefs` — which the `.initialState`
+        /// subscription's first message always does — failed to decode and
+        /// was dropped. Kept, as optional, so existing callers still compile;
+        /// it is always nil against a current backend.
+        public var AllowSingleHosts: Bool?
         public var CorpDNS: Bool = false
         public var WantRunning: Bool = false
         public var LoggedOut: Bool = false
@@ -365,6 +372,33 @@ public struct Tailcfg: Sendable {
 
         public var ComputedName: String
         public var ComputedNameWithHost: String
+
+        /// `Hostinfo`, `ComputedName` and `ComputedNameWithHost` are tagged
+        /// `json:",omitzero"` on the Go side, so a peer with no hostinfo or
+        /// an empty computed name arrives with the key absent altogether.
+        /// Synthesized `Decodable` treats a non-optional property as a
+        /// required key and would fail the whole netmap over that one node;
+        /// decode those three as present-or-default instead. Encoding stays
+        /// synthesized.
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            ID = try c.decode(Tailcfg.NodeID.self, forKey: .ID)
+            StableID = try c.decode(Tailcfg.StableNodeID.self, forKey: .StableID)
+            Name = try c.decode(String.self, forKey: .Name)
+            User = try c.decode(Tailcfg.UserID.self, forKey: .User)
+            Sharer = try c.decodeIfPresent(Tailcfg.UserID.self, forKey: .Sharer)
+            Key = try c.decode(TailscaleKit.Key.NodePublic.self, forKey: .Key)
+            KeyExpiry = try c.decodeIfPresent(Time.Time.self, forKey: .KeyExpiry)
+            Addresses = try c.decodeIfPresent([IP.Prefix].self, forKey: .Addresses)
+            AllowedIPs = try c.decodeIfPresent([IP.Prefix].self, forKey: .AllowedIPs)
+            Hostinfo = try c.decodeIfPresent(Tailcfg.Hostinfo.self, forKey: .Hostinfo) ?? Tailcfg.Hostinfo()
+            LastSeen = try c.decodeIfPresent(Time.Time.self, forKey: .LastSeen)
+            Online = try c.decodeIfPresent(Bool.self, forKey: .Online)
+            Capabilities = try c.decodeIfPresent([String].self, forKey: .Capabilities)
+            Tags = try c.decodeIfPresent([String].self, forKey: .Tags)
+            ComputedName = try c.decodeIfPresent(String.self, forKey: .ComputedName) ?? ""
+            ComputedNameWithHost = try c.decodeIfPresent(String.self, forKey: .ComputedNameWithHost) ?? ""
+        }
 
         // reports whether Node offers default routing services.
         public var IsExitNode: Bool {
