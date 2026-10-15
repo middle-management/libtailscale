@@ -24,24 +24,24 @@ import (
 
 // wireConnInfo is the wire form of [ConnInfo].
 type wireConnInfo struct {
-	ServerPublic NodePublic    `cbor:"p" json:"ServerPublic"`
-	Region       []*wireRegion `cbor:"r,omitempty" json:"Region,omitempty"`
-	RegionID     int           `cbor:"i,omitempty" json:"RegionID,omitempty"`
+	ServerPublic NodePublic           `cbor:"p" json:"ServerPublic"`
+	Region       []*wireRegion        `cbor:"r,omitempty" json:"Region,omitempty"`
+	RegionID     tailcfg.DERPRegionID `cbor:"i,omitempty" json:"RegionID,omitempty"`
 }
 
 // wireRegion is the wire form of [tailcfg.DERPRegion].
 type wireRegion struct {
-	RegionID   int         `cbor:"i,omitempty" json:"RegionID,omitempty"`
-	RegionCode string      `cbor:"c,omitempty" json:"RegionCode,omitempty"`
-	RegionName string      `cbor:"m,omitempty" json:"RegionName,omitempty"`
-	Nodes      []*wireNode `cbor:"N,omitempty" json:"Nodes,omitempty"`
+	RegionID   tailcfg.DERPRegionID `cbor:"i,omitempty" json:"RegionID,omitempty"`
+	RegionCode string               `cbor:"c,omitempty" json:"RegionCode,omitempty"`
+	RegionName string               `cbor:"m,omitempty" json:"RegionName,omitempty"`
+	Nodes      []*wireNode          `cbor:"N,omitempty" json:"Nodes,omitempty"`
 }
 
 // wireNode is the wire form of [tailcfg.DERPNode].
 type wireNode struct {
-	Name     string `cbor:"n,omitempty" json:"Name,omitempty"`
-	RegionID int    `cbor:"i,omitempty" json:"RegionID,omitempty"`
-	HostName string `cbor:"h,omitempty" json:"HostName,omitempty"`
+	Name     string               `cbor:"n,omitempty" json:"Name,omitempty"`
+	RegionID tailcfg.DERPRegionID `cbor:"i,omitempty" json:"RegionID,omitempty"`
+	HostName string               `cbor:"h,omitempty" json:"HostName,omitempty"`
 
 	// CertName is the expected TLS cert name when it differs from
 	// HostName (which is used for the SNI). Empty means the cert is

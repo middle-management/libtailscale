@@ -11,7 +11,13 @@ export CGO_ENABLED=1
 # This should match the minimum target in the xCode project
 # The wrapper lib currently requires features available in
 # MacOS 15.0 (Sequoia)
-MACOS_TARGET := 15.0
+#
+# `?=` rather than `:=` so the environment can override it. With `:=`,
+# `MACOS_TARGET=14.0 make c-archive` is silently ignored — make reports success
+# and builds 15.0 anyway, because an environment variable does not override a
+# makefile assignment. Only `make MACOS_TARGET=14.0 c-archive` worked, which is
+# easy to get wrong and gives no signal when you do.
+MACOS_TARGET ?= 15.0
 
 # Set macOS-specific flags for darwin builds
 ifeq ($(GOOS),darwin)
@@ -49,6 +55,29 @@ c-archive: libtailscale.a  ## Builds libtailscale.a for the target platform
 
 .PHONY: shared
 shared: libtailscale.so ## Builds libtailscale.so for the target platform
+
+.PHONY: test
+test: test-go test-ruby test-swift ## Runs all tests available on the host platform
+
+.PHONY: test-go
+test-go: ## Runs Go and C integration tests
+	go test -v ./...
+
+.PHONY: test-ruby
+test-ruby: ## Runs Ruby binding tests (requires ruby, bundler)
+	@if command -v bundle >/dev/null 2>&1 && [ -f ruby/Gemfile ]; then \
+		cd ruby && bundle exec rake test; \
+	else \
+		echo "skipping ruby tests: bundle not found"; \
+	fi
+
+.PHONY: test-swift
+test-swift: ## Runs Swift binding tests (requires macOS, xcodebuild)
+	@if [ "$(GOOS)" = "darwin" ] && command -v xcodebuild >/dev/null 2>&1; then \
+		cd swift && $(MAKE) test; \
+	else \
+		echo "skipping swift tests: requires macOS with xcodebuild"; \
+	fi
 
 .PHONY: clean
 clean: ## Clean up build artifacts

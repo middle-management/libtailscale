@@ -38,8 +38,7 @@ func (s *unixStream) CloseRead() error  { return syscall.Shutdown(s.fd, syscall.
 func (s *unixStream) CloseWrite() error { return syscall.Shutdown(s.fd, syscall.SHUT_WR) }
 
 // sendConn hands an accepted connection to the C consumer as an SCM_RIGHTS
-// descriptor, with the remote address carried inband in a fixed-size field so
-// the framing stays aligned per accepted fd.
+// descriptor, with its fixed-size listenAddrLen address record as the data.
 //
 // The receiver gets a *fresh* fd number — a dup of the same open file
 // description — which is why TsnetAccept keys its remote-address table by the
@@ -60,28 +59,52 @@ func newBridgeStreamPair() (bridgeStream, C.int, error) {
 }
 
 // recvBridgeConn is the consumer half of sendConn, called on the C-side
-// descriptor the C caller passes to tailscale_accept.
-func recvBridgeConn(listenerFd C.int, addrBuf []byte) (connFd C.int, n int, err error) {
+// descriptor the C caller passes to tailscale_accept. It fills rec with
+// exactly one record.
+//
+// The pair is a stream socket, so records are framed here: each read asks for
+// the remaining bytes of the head record, with MSG_WAITALL. The FIFO never
+// serves a later record's bytes first, so each accept consumes exactly one
+// record, even concurrently or after EINTR.
+func recvBridgeConn(listenerFd C.int, rec []byte) (connFd C.int, err error) {
 	oob := make([]byte, unix.CmsgLen(int(unsafe.Sizeof((C.int)(0)))))
-	n, oobn, _, _, err := syscall.Recvmsg(int(listenerFd), addrBuf, oob, 0)
-	if err != nil {
-		return 0, 0, err
+	var n, oobn int
+	for n < len(rec) {
+		if n > 0 {
+			// the cmsg rode with the record's first byte; only the tail remains
+			oob = nil
+		}
+		nn, on, _, _, err := syscall.Recvmsg(int(listenerFd), rec[n:], oob, syscall.MSG_WAITALL)
+		n += nn
+		if nn > 0 && oob != nil {
+			oobn = on
+		}
+		if err == syscall.EINTR {
+			continue // partial bytes stay record-aligned, keep draining
+		}
+		if err != nil {
+			return 0, err
+		}
+		if nn == 0 {
+			// EOF mid-record: the listener was closed on the C side.
+			return 0, fmt.Errorf("libtailscale: listener closed mid-record: got %d of %d bytes", n, len(rec))
+		}
 	}
 	scms, err := syscall.ParseSocketControlMessage(oob[:oobn])
 	if err != nil {
-		return 0, 0, err
+		return 0, err
 	}
 	if len(scms) != 1 {
-		return 0, 0, fmt.Errorf("libtailscale: got %d control messages, want 1", len(scms))
+		return 0, fmt.Errorf("libtailscale: got %d control messages, want 1", len(scms))
 	}
 	fds, err := syscall.ParseUnixRights(&scms[0])
 	if err != nil {
-		return 0, 0, err
+		return 0, err
 	}
 	if len(fds) != 1 {
-		return 0, 0, fmt.Errorf("libtailscale: got %d FDs, want 1", len(fds))
+		return 0, fmt.Errorf("libtailscale: got %d FDs, want 1", len(fds))
 	}
-	return C.int(fds[0]), n, nil
+	return C.int(fds[0]), nil
 }
 
 // unixPacket is the Go end of a datagram socketpair.

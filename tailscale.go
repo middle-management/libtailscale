@@ -60,8 +60,16 @@ type listener struct {
 	ln net.Listener
 	sp bridgeStream // go side of the bridge pair whose C end went to C
 	mu sync.Mutex
-	m  map[C.int]net.Addr //maps fds to remote addresses for lookup
+	// m maps the fd number C holds for an accepted connection (not our
+	// sender-side number; recvmsg installs a new one) to its remote IP.
+	m map[C.int]string
 }
+
+// listenAddrLen is the size of the fixed-size, NUL-padded record that
+// carries each accepted connection's remote IP over the listener
+// socketpair. Fixed size so TsnetAccept frames the stream with
+// exact-size reads; 45 bytes covers the longest textual IP.
+const listenAddrLen = 64
 
 // conns tracks all the pipe(2)s allocated via tsnet_dial.
 var conns struct {
@@ -258,7 +266,7 @@ func bridgeListen(s *server, ln net.Listener, listenerOut *C.int) C.int {
 	if listeners.m == nil {
 		listeners.m = map[C.int]*listener{}
 	}
-	listener := &listener{s: s, ln: ln, sp: sp, m: map[C.int]net.Addr{}}
+	listener := &listener{s: s, ln: ln, sp: sp, m: map[C.int]string{}}
 	listeners.m[fdC] = listener
 	listeners.mu.Unlock()
 
@@ -298,23 +306,25 @@ func bridgeListen(s *server, ln net.Listener, listenerOut *C.int) C.int {
 				netConn.Close()
 				continue
 			}
-			// Carry the remote address inband alongside the handed-over
-			// descriptor so the consumer (TsnetAccept) can key it by the
-			// number it actually receives. Keying the lookup table by connFd
-			// here is wrong on Unix: SCM_RIGHTS hands the receiver a *fresh*
-			// fd number (a dup of the same open file description), so a later
-			// tailscale_getremoteaddr(receivedFd) misses the connFd-keyed
-			// entry and returns EBADF non-deterministically. A fixed-size
-			// field keeps the framing aligned per accepted connection.
-			var addrBuf [256]byte
-			copy(addrBuf[:255], netConn.RemoteAddr().String())
-			if err := sp.sendConn(connFd, addrBuf[:]); err != nil {
-				// We handle sp being closed in the read goroutine above.
+			ip := extractIP(netConn.RemoteAddr().String())
+			if len(ip) >= listenAddrLen {
+				if s.s != nil && s.s.Logf != nil {
+					s.s.Logf("libtailscale.accept: remote address %q does not fit in a %d-byte record", ip, listenAddrLen)
+				}
+				netConn.Close()
+				closeBridgeCSide(connFd)
+				continue
+			}
+			var addrRec [listenAddrLen]byte
+			copy(addrRec[:], ip)
+
+			if err := sp.sendConn(connFd, addrRec[:]); err != nil {
+				// a failed send delivered nothing (sp being closed is
+				// handled by the read goroutine above)
 				if s.s != nil && s.s.Logf != nil {
 					s.s.Logf("libtailscale.accept: sendConn failed: %v", err)
 				}
 				netConn.Close()
-				// fallthrough to close connFd, then continue Accept()ing
 			}
 
 			closeBridgeCSide(connFd) // now owned by the receiver
@@ -335,38 +345,28 @@ func TsnetAccept(listenerFd C.int, connOut *C.int) C.int {
 		return C.EBADF
 	}
 
-	// The accept goroutine sends the connection's remote address inband as a
-	// fixed 256-byte field alongside the descriptor (see the sender side).
-	addrBuf := make([]byte, 256)
-	connFd, n, err := recvBridgeConn(listenerFd, addrBuf)
+	// One record per connection: the conn handed over plus its remote IP.
+	// connFd is the number C will hold, which is why the table below is
+	// keyed by it and not by the sender's number.
+	data := make([]byte, listenAddrLen)
+	connFd, err := recvBridgeConn(listenerFd, data)
 	if err != nil {
 		return ln.s.recErr(err)
 	}
-	*connOut = connFd
 
-	// Key the remote-address table by the fd we just handed C — the same fd
-	// it will pass back to tailscale_getremoteaddr. (See the sender side in
-	// the accept goroutine for why connFd can't be used as the key.)
-	if n > 0 {
-		if i := bytes.IndexByte(addrBuf[:n], 0); i >= 0 {
-			n = i
-		}
-		ln.mu.Lock()
-		ln.m[*connOut] = stringAddr(addrBuf[:n])
-		ln.mu.Unlock()
+	// the entry must exist before C can learn this fd number
+	addrLen := bytes.IndexByte(data, 0)
+	if addrLen < 0 {
+		addrLen = listenAddrLen
 	}
+	ln.mu.Lock()
+	ln.m[connFd] = string(data[:addrLen])
+	ln.mu.Unlock()
+
+	*connOut = connFd
 
 	return 0
 }
-
-// stringAddr is a net.Addr that carries only a pre-resolved address string.
-// It shuttles a connection's remote address from the accept goroutine to the
-// consumer (TsnetAccept) without depending on fd-number identity across the
-// SCM_RIGHTS handoff.
-type stringAddr string
-
-func (a stringAddr) Network() string { return "tcp" }
-func (a stringAddr) String() string  { return string(a) }
 
 func newConn(s *server, netConn net.Conn, connOut *C.int) error {
 	r, fdC, err := newBridgeStreamPair()
@@ -398,8 +398,12 @@ func newConn(s *server, netConn net.Conn, connOut *C.int) error {
 		r.Close()
 		netConn.Close()
 	}
+	// the half-closes below must precede connCleanup: they act on r's fd
+	// number, which Close frees for reuse. Wait for both copy directions.
+	var copies sync.WaitGroup
+	copies.Add(2)
 	go func() {
-		defer connCleanup()
+		defer copies.Done()
 		var b [1 << 16]byte
 		io.CopyBuffer(r, netConn, b[:])
 		r.CloseWrite()
@@ -408,13 +412,17 @@ func newConn(s *server, netConn net.Conn, connOut *C.int) error {
 		}
 	}()
 	go func() {
-		defer connCleanup()
+		defer copies.Done()
 		var b [1 << 16]byte
 		io.CopyBuffer(netConn, r, b[:])
 		r.CloseRead()
 		if cw, ok := netConn.(interface{ CloseWrite() error }); ok {
 			cw.CloseWrite()
 		}
+	}()
+	go func() {
+		copies.Wait()
+		connCleanup()
 	}()
 
 	*connOut = fdC
@@ -440,13 +448,13 @@ func TsnetGetRemoteAddr(listener C.int, conn C.int, buf *C.char, buflen C.size_t
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	addr, ok := l.m[conn]
+	ip, ok := l.m[conn]
 	if !ok {
+		// set errmsg too: EBADF with an empty message is not debuggable
+		l.s.lastErr = fmt.Sprintf("libtailscale: getremoteaddr: no remote address recorded for conn %d on listener %d", conn, listener)
 		out[0] = '\x00'
 		return C.EBADF
 	}
-
-	ip := extractIP(addr.String())
 
 	n := copy(out, ip)
 	if n >= len(out) {

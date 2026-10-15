@@ -61,17 +61,14 @@ func (s *winStream) Close() error                { return s.c.Close() }
 func (s *winStream) CloseRead() error            { return s.c.CloseRead() }
 func (s *winStream) CloseWrite() error           { return s.c.CloseWrite() }
 
-// connHandoffAddrLen matches the fixed address field the Unix side sends
-// alongside SCM_RIGHTS, so both platforms frame the handoff identically.
-const connHandoffAddrLen = 256
-
 // sendConn announces an accepted connection to the C consumer: the handle
-// value followed by the same fixed-size address field the Unix path uses.
+// value followed by the same fixed-size listenAddrLen address record the Unix
+// path uses.
 //
 // One write, so the stream carries whole records and the reader can consume a
-// fixed 4+256 bytes per accepted connection.
+// fixed 4+listenAddrLen bytes per accepted connection.
 func (s *winStream) sendConn(connFd C.int, addrBuf []byte) error {
-	msg := make([]byte, 4+connHandoffAddrLen)
+	msg := make([]byte, 4+listenAddrLen)
 	binary.LittleEndian.PutUint32(msg[:4], uint32(int32(connFd)))
 	copy(msg[4:], addrBuf)
 	_, err := s.c.Write(msg)
@@ -138,24 +135,25 @@ func newBridgeStreamPair() (bridgeStream, C.int, error) {
 	return &winStream{c: tcp}, fdC, nil
 }
 
-// recvBridgeConn is the consumer half of sendConn, reading the fixed 4+256-byte
-// record off the C-side handle the caller passed to tailscale_accept.
-func recvBridgeConn(listenerFd C.int, addrBuf []byte) (connFd C.int, n int, err error) {
-	msg := make([]byte, 4+connHandoffAddrLen)
+// recvBridgeConn is the consumer half of sendConn, reading the fixed
+// 4+listenAddrLen-byte record off the C-side handle the caller passed to
+// tailscale_accept. It fills rec with the address part.
+func recvBridgeConn(listenerFd C.int, rec []byte) (connFd C.int, err error) {
+	msg := make([]byte, 4+listenAddrLen)
 	read := 0
 	for read < len(msg) {
 		got, err := recvHandle(syscall.Handle(listenerFd), msg[read:])
 		if err != nil {
-			return 0, 0, err
+			return 0, err
 		}
 		if got == 0 {
-			return 0, 0, fmt.Errorf("libtailscale: listener control channel closed")
+			return 0, fmt.Errorf("libtailscale: listener control channel closed")
 		}
 		read += got
 	}
 	connFd = C.int(int32(binary.LittleEndian.Uint32(msg[:4])))
-	n = copy(addrBuf, msg[4:])
-	return connFd, n, nil
+	copy(rec, msg[4:])
+	return connFd, nil
 }
 
 // winPacket is the Go end of an emulated datagram socketpair. A connected

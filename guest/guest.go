@@ -158,7 +158,7 @@ type ConnInfo struct {
 	// the derpmap from tailscale.com once at startup.
 	// If -1 (for use when saving a keypair to disk for reuse later), a region
 	// is selected automatically at startup based on latency.
-	RegionID int `json:",omitempty"`
+	RegionID tailcfg.DERPRegionID `json:",omitempty"`
 }
 
 // NodePublic is a wrapper around key.NodePublic just so we can have a slightly
@@ -226,14 +226,14 @@ type locoBackend struct {
 
 	// onDERPRecv is called for non-disco DERP packets before the
 	// peer map lookup. Set before createEngine.
-	onDERPRecv func(regionID int, src key.NodePublic, pkt []byte) bool
+	onDERPRecv func(regionID tailcfg.DERPRegionID, src key.NodePublic, pkt []byte) bool
 
 	// skipEndpointAdvertise mirrors Server/Client.skipEndpointAdvertise,
 	// copied in at startup (before any peer exists to advertise to).
 	skipEndpointAdvertise bool
 
-	mu             sync.Mutex
-	clients        map[key.NodePublic]*tailcfg.Node // for the server
+	mu      sync.Mutex
+	clients map[key.NodePublic]*tailcfg.Node // for the server
 	// deniedClients holds evicted node keys (see [Server.RemoveClient]):
 	// their meows are silently ignored, exactly like an allowlist miss.
 	// Local addition; upstream tailcat has no removal at all.
@@ -246,13 +246,13 @@ type locoBackend struct {
 	// for NEW flows, and the WireGuard session itself outlives the netmap
 	// removal until rekey — without this, an evicted peer's established
 	// RTP flow would keep flowing. Local addition.
-	flows map[netip.Addr]map[io.Closer]bool
+	flows          map[netip.Addr]map[io.Closer]bool
 	nm             *netmap.NetworkMap
 	allowedClients map[key.NodePublic]bool // or nil map for all
 	eps            []netip.AddrPort        // our current local UDP endpoints, sorted
 }
 
-func (b *locoBackend) derpRegionID() int {
+func (b *locoBackend) derpRegionID() tailcfg.DERPRegionID {
 	if b.dm == nil {
 		panic("no derp map")
 	}
@@ -296,7 +296,7 @@ type Server struct {
 	// RegionID, if non-zero and Region is nil, is the ID of the DERP
 	// map region to use. If zero, the nearest region is picked based
 	// on latency at Start.
-	RegionID int
+	RegionID tailcfg.DERPRegionID
 
 	// DERPMapURL, if non-empty, is an alternate URL to fetch the DERP
 	// map from when Region is nil. If empty, [DefaultDERPMapURL] is
@@ -442,7 +442,7 @@ func (s *Server) Start() error {
 	sys.Set(store)
 
 	lb.isServer = true
-	lb.onDERPRecv = func(regionID int, src key.NodePublic, pkt []byte) bool {
+	lb.onDERPRecv = func(regionID tailcfg.DERPRegionID, src key.NodePublic, pkt []byte) bool {
 		if !IsMeowPacket(pkt) {
 			return false
 		}
@@ -909,7 +909,7 @@ func ParseConnBlob(cb ConnBlob) (ConnInfo, error) {
 	}
 	for ri, r := range ci.Region {
 		if r.RegionID == 0 {
-			r.RegionID = ri + 1
+			r.RegionID = tailcfg.DERPRegionID(ri + 1)
 		}
 		if r.RegionCode == "" {
 			r.RegionCode = fmt.Sprint(r.RegionID)
@@ -1164,25 +1164,25 @@ func (ci *ConnInfo) Expand(ctx context.Context, opts ...any) error {
 
 var allIPv6 = netip.MustParsePrefix("::/0")
 
-// peerAllowedIPs returns the prefixes that the peer with public key k
-// is allowed to originate traffic from. It is the engine's per-peer
-// WireGuard config source (see [wgengine.Engine.SetPeerConfigFunc]).
-func (b *locoBackend) peerAllowedIPs(k key.NodePublic) (allowedIPs []netip.Prefix, ok bool) {
+// peerConfig returns the WireGuard config for the peer with public key k:
+// the prefixes it may originate traffic from, and no pre-shared key. It is the
+// engine's per-peer config source (see [wgengine.Engine.SetPeerConfigFunc]).
+func (b *locoBackend) peerConfig(k key.NodePublic) (cfg wgcfg.PeerConfig, ok bool) {
 	if !b.serverPub.IsZero() {
 		// We're the client; the server is our only peer and may send
 		// from any address (it can act as an exit node).
 		if k == b.serverPub {
-			return []netip.Prefix{pfxOf(tcAddrForKey(k)), allIPv6}, true
+			return wgcfg.PeerConfig{AllowedIPs: []netip.Prefix{pfxOf(tcAddrForKey(k)), allIPv6}}, true
 		}
-		return nil, false
+		return cfg, false
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	n, ok := b.clients[k]
 	if !ok {
-		return nil, false
+		return cfg, false
 	}
-	return n.AllowedIPs, true
+	return wgcfg.PeerConfig{AllowedIPs: n.AllowedIPs}, true
 }
 
 // trackFlow registers a live flow conn for addr so RemoveClient can
@@ -1421,7 +1421,7 @@ func (lb *locoBackend) Start() error {
 	// Install the live per-peer config sources. WireGuard peers are
 	// created lazily from these as traffic arrives; there is no
 	// peer list in wgcfg.Config anymore.
-	e.SetPeerConfigFunc(lb.peerAllowedIPs)
+	e.SetPeerConfigFunc(lb.peerConfig)
 	e.SetPeerByIPPacketFunc(lb.peerByIP)
 	e.SetPeerForIPFunc(lb.peerForIP)
 	e.SetStatusCallback(lb.onEngineStatus)
@@ -1503,7 +1503,7 @@ func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool 
 // rebuildNetmapLocked rebuilds the netmap from the current client set and
 // pushes it to magicsock and netstack. b.mu must be held. Extracted from
 // onMeow so RemoveClient can reuse it.
-func (b *locoBackend) rebuildNetmapLocked(derpRegion int) {
+func (b *locoBackend) rebuildNetmapLocked(derpRegion tailcfg.DERPRegionID) {
 	nm := &netmap.NetworkMap{
 		NodeKey: b.pub,
 		SelfNode: (&tailcfg.Node{
@@ -1719,7 +1719,7 @@ func (c *Client) initLocked() error {
 		// endpoints so both sides can attempt a direct path.
 		lb.advertiseEndpoints()
 	})
-	lb.onDERPRecv = func(regionID int, src key.NodePublic, pkt []byte) bool {
+	lb.onDERPRecv = func(regionID tailcfg.DERPRegionID, src key.NodePublic, pkt []byte) bool {
 		if !IsMeowPacket(pkt) {
 			return false
 		}
