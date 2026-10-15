@@ -1,11 +1,29 @@
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
 
+#if canImport(Combine)
 import Combine
+#endif
 import Foundation
+#if canImport(libtailscale)
+import libtailscale
+#endif
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+
+#endif
 
 /// A Listener is used to await incoming connections from another
 /// Tailnet node.
+// Gated so the rest of TailscaleKit can be built for older systems.
+// `state()` returns `any AsyncSequence<ListenerState, Never>`, whose `Failure`
+// associated type is iOS 18 / macOS 15 only, and that requirement propagates to
+// the whole framework even for clients that never listen for inbound
+// connections. Annotating the two listener types confines it to them.
+@available(iOS 18.0, macOS 15.0, tvOS 18.0, watchOS 11.0, *)
 public actor Listener {
     private var tailscale: TailscaleHandle 
     private var listener: TailscaleListener = 0
@@ -14,6 +32,7 @@ public actor Listener {
 
     private let logger: LogSink?
 
+#if canImport(Combine)
     @Published var _state: ListenerState = .idle
 
     public func state() -> any AsyncSequence<ListenerState, Never> {
@@ -22,6 +41,24 @@ public actor Listener {
             .eraseToAnyPublisher()
             .values
     }
+#else
+    // Combine is Apple-only; AsyncStream provides the same
+    // current-value-then-updates sequence on other platforms.
+    var _state: ListenerState = .idle {
+        didSet {
+            guard _state != oldValue else { return }
+            for continuation in stateContinuations { continuation.yield(_state) }
+        }
+    }
+    private var stateContinuations: [AsyncStream<ListenerState>.Continuation] = []
+
+    public func state() -> any AsyncSequence<ListenerState, Never> {
+        AsyncStream { continuation in
+            continuation.yield(_state)
+            stateContinuations.append(continuation)
+        }
+    }
+#endif
 
     /// Initializes and readies a new listener
     ///
@@ -47,6 +84,25 @@ public actor Listener {
             logger?.log("Listener failed to initialize: \(msg) (\(err.localizedDescription))")
             throw err
         }
+        _state = .listening
+    }
+
+    /// Adopts an already-open listener fd — a guest node's TCP listener
+    /// (guest_server_listen in tailscale.h), which is consumed with the
+    /// same tailscale_accept machinery as a tsnet listener. `handle` is
+    /// only consulted for error messages.
+    // async like the primary init: the Combine branch's @Published _state
+    // is actor-isolated, and only an async (isolated) initializer may set
+    // it — a sync init fails to compile under Swift 6.
+    internal init(adopting fd: TailscaleListener,
+                  handle: TailscaleHandle,
+                  address: String,
+                  logger: LogSink? = nil) async {
+        self.logger = logger
+        self.tailscale = handle
+        self.address = address
+        self.proto = .tcp
+        self.listener = fd
         _state = .listening
     }
 
@@ -84,9 +140,14 @@ public actor Listener {
 
         var p: pollfd = .init(fd: listener, events: Int16(POLLIN), revents: 0)
         let ret = poll(&p, 1, Int32(timeout * 1000))
-        guard ret > 0 else {
+        if ret == 0 {
+            // Plain poll timeout. The listener is still fine; let the caller
+            // decide whether to retry. Don't close it — that's a fatal path.
+            throw TailscaleError.readFailed
+        }
+        if ret < 0 {
             close()
-            throw TailscaleError.fromPosixErrCode(errno, "Poll failed")
+            throw TailscaleError.fromPosixErrCode(tailscaleLastSocketError, "Poll failed")
         }
 
         logger?.log("Accepting \(proto.rawValue) connection via \(address)")

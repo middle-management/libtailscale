@@ -8,6 +8,7 @@ package main
 import "C"
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -18,11 +19,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 	"unsafe"
 
-	"golang.org/x/sys/unix"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
 	"tailscale.com/tsnet"
@@ -59,10 +58,18 @@ var listeners struct {
 type listener struct {
 	s  *server
 	ln net.Listener
-	fd int // go side fd of socketpair sent to C
+	sp bridgeStream // go side of the bridge pair whose C end went to C
 	mu sync.Mutex
-	m  map[C.int]net.Addr //maps fds to remote addresses for lookup
+	// m maps the fd number C holds for an accepted connection (not our
+	// sender-side number; recvmsg installs a new one) to its remote IP.
+	m map[C.int]string
 }
+
+// listenAddrLen is the size of the fixed-size, NUL-padded record that
+// carries each accepted connection's remote IP over the listener
+// socketpair. Fixed size so TsnetAccept frames the stream with
+// exact-size reads; 45 bytes covers the longest textual IP.
+const listenAddrLen = 64
 
 // conns tracks all the pipe(2)s allocated via tsnet_dial.
 var conns struct {
@@ -73,7 +80,7 @@ var conns struct {
 type conn struct {
 	s *tsnet.Server
 	c net.Conn
-	r *os.File // r is the local socket to the C client
+	r bridgeStream // r is the local socket to the C client
 }
 
 func (s *server) recErr(err error) C.int {
@@ -225,35 +232,52 @@ func TsnetListen(sd C.int, network, addr *C.char, listenerOut *C.int) C.int {
 		return s.recErr(err)
 	}
 	s.started = true
+	return bridgeListen(s, ln, listenerOut)
+}
 
-	// The tailscale_listener we return to C is one side of a socketpair(2).
+// bridgeListen wires an already-open net.Listener to a C-consumable
+// listener fd: the accept pump, the SCM_RIGHTS (or Windows record)
+// handoff, and the teardown-on-close plumbing. Factored out of
+// TsnetListen so the guest (control-plane-free) surface can serve its
+// callback-delivered connections through the exact same machinery —
+// including tailscale_accept and tailscale_getremoteaddr on the C side.
+// s is only used for error recording and logging; its tsnet server may
+// be nil (the guest surface passes a bare error-sink server).
+func bridgeListen(s *server, ln net.Listener, listenerOut *C.int) C.int {
+	// The tailscale_listener we return to C is one side of a bridge socket
+	// pair (socketpair(2) on Unix, a loopback pair on Windows).
 	// We do this so we can proactively call ln.Accept in a goroutine and
 	// feed an fd for the connection through the listener. This lets C use
 	// epoll on the tailscale_listener to know if it should call
 	// tailscale_accept, which avoids a blocking call on the far side.
-	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
+	spRaw, fdC, err := newBridgeStreamPair()
 	if err != nil {
 		return s.recErr(err)
 	}
-	sp := fds[1]
-	fdC := C.int(fds[0])
+	// The accept handoff needs more than the io half of the seam: on Unix it
+	// is an SCM_RIGHTS sendmsg, on Windows a plain record write.
+	sp, ok := spRaw.(bridgeConnSender)
+	if !ok {
+		spRaw.Close()
+		return s.recErr(fmt.Errorf("libtailscale: bridge stream %T cannot hand over connections", spRaw))
+	}
 
 	listeners.mu.Lock()
 	if listeners.m == nil {
 		listeners.m = map[C.int]*listener{}
 	}
-	listener := &listener{s: s, ln: ln, fd: sp, m: map[C.int]net.Addr{}}
+	listener := &listener{s: s, ln: ln, sp: sp, m: map[C.int]string{}}
 	listeners.m[fdC] = listener
 	listeners.mu.Unlock()
 
 	cleanup := func() {
 		// If fdC is closed on the C side, then we end up calling
-		// into cleanup twice. Be careful to avoid syscall.Close
-		// twice as the FD may have been reallocated.
+		// into cleanup twice. Be careful to avoid closing the Go end
+		// twice as the descriptor may have been reallocated.
 		listeners.mu.Lock()
 		if tsLn, ok := listeners.m[fdC]; ok && tsLn.ln == ln {
 			delete(listeners.m, fdC)
-			syscall.Close(sp)
+			sp.Close()
 		}
 		listeners.mu.Unlock()
 
@@ -263,10 +287,8 @@ func TsnetListen(sd C.int, network, addr *C.char, listenerOut *C.int) C.int {
 		// fdC is never written to, so trying to read from sp blocks
 		// until fdC is closed. We use this as a signal that C is
 		// done with the listener, and we can tear it down.
-		//
-		// TODO: would using os.NewFile avoid a locked up thread?
 		var buf [256]byte
-		syscall.Read(sp, buf[:])
+		sp.Read(buf[:])
 		cleanup()
 	}()
 	go func() {
@@ -278,29 +300,34 @@ func TsnetListen(sd C.int, network, addr *C.char, listenerOut *C.int) C.int {
 			}
 			var connFd C.int
 			if err := newConn(s, netConn, &connFd); err != nil {
-				if s.s.Logf != nil {
+				if s.s != nil && s.s.Logf != nil {
 					s.s.Logf("libtailscale.accept: newConn: %v", err)
 				}
 				netConn.Close()
 				continue
 			}
-			rights := syscall.UnixRights(int(connFd))
-			err = syscall.Sendmsg(sp, nil, rights, nil, 0)
-			if err != nil {
-				// We handle sp being closed in the read goroutine above.
-				if s.s.Logf != nil {
-					s.s.Logf("libtailscale.accept: sendmsg failed: %v", err)
+			ip := extractIP(netConn.RemoteAddr().String())
+			if len(ip) >= listenAddrLen {
+				if s.s != nil && s.s.Logf != nil {
+					s.s.Logf("libtailscale.accept: remote address %q does not fit in a %d-byte record", ip, listenAddrLen)
 				}
 				netConn.Close()
-				// fallthrough to close connFd, then continue Accept()ing
+				closeBridgeCSide(connFd)
+				continue
+			}
+			var addrRec [listenAddrLen]byte
+			copy(addrRec[:], ip)
+
+			if err := sp.sendConn(connFd, addrRec[:]); err != nil {
+				// a failed send delivered nothing (sp being closed is
+				// handled by the read goroutine above)
+				if s.s != nil && s.s.Logf != nil {
+					s.s.Logf("libtailscale.accept: sendConn failed: %v", err)
+				}
+				netConn.Close()
 			}
 
-			// map the connection to the remote address
-			listener.mu.Lock()
-			listener.m[connFd] = netConn.RemoteAddr()
-			listener.mu.Unlock()
-
-			syscall.Close(int(connFd)) // now owned by recvmsg
+			closeBridgeCSide(connFd) // now owned by the receiver
 		}
 	}()
 
@@ -318,39 +345,35 @@ func TsnetAccept(listenerFd C.int, connOut *C.int) C.int {
 		return C.EBADF
 	}
 
-	buf := make([]byte, unix.CmsgLen(int(unsafe.Sizeof((C.int)(0)))))
-	_, oobn, _, _, err := syscall.Recvmsg(int(listenerFd), nil, buf, 0)
+	// One record per connection: the conn handed over plus its remote IP.
+	// connFd is the number C will hold, which is why the table below is
+	// keyed by it and not by the sender's number.
+	data := make([]byte, listenAddrLen)
+	connFd, err := recvBridgeConn(listenerFd, data)
 	if err != nil {
 		return ln.s.recErr(err)
 	}
 
-	scms, err := syscall.ParseSocketControlMessage(buf[:oobn])
-	if err != nil {
-		return ln.s.recErr(err)
+	// the entry must exist before C can learn this fd number
+	addrLen := bytes.IndexByte(data, 0)
+	if addrLen < 0 {
+		addrLen = listenAddrLen
 	}
-	if len(scms) != 1 {
-		return ln.s.recErr(fmt.Errorf("libtailscale: got %d control messages, want 1", len(scms)))
-	}
-	fds, err := syscall.ParseUnixRights(&scms[0])
-	if err != nil {
-		return ln.s.recErr(err)
-	}
-	if len(fds) != 1 {
-		return ln.s.recErr(fmt.Errorf("libtailscale: got %d FDs, want 1", len(fds)))
-	}
-	*connOut = (C.int)(fds[0])
+	ln.mu.Lock()
+	ln.m[connFd] = string(data[:addrLen])
+	ln.mu.Unlock()
+
+	*connOut = connFd
 
 	return 0
 }
 
 func newConn(s *server, netConn net.Conn, connOut *C.int) error {
-	fds, err := syscall.Socketpair(syscall.AF_LOCAL, syscall.SOCK_STREAM, 0)
+	r, fdC, err := newBridgeStreamPair()
 	if err != nil {
 		return err
 	}
-	r := os.NewFile(uintptr(fds[1]), "socketpair-r")
 	c := &conn{s: s.s, c: netConn, r: r}
-	fdC := C.int(fds[0])
 
 	conns.mu.Lock()
 	if conns.m == nil {
@@ -375,23 +398,31 @@ func newConn(s *server, netConn net.Conn, connOut *C.int) error {
 		r.Close()
 		netConn.Close()
 	}
+	// the half-closes below must precede connCleanup: they act on r's fd
+	// number, which Close frees for reuse. Wait for both copy directions.
+	var copies sync.WaitGroup
+	copies.Add(2)
 	go func() {
-		defer connCleanup()
+		defer copies.Done()
 		var b [1 << 16]byte
 		io.CopyBuffer(r, netConn, b[:])
-		syscall.Shutdown(int(r.Fd()), syscall.SHUT_WR)
+		r.CloseWrite()
 		if cr, ok := netConn.(interface{ CloseRead() error }); ok {
 			cr.CloseRead()
 		}
 	}()
 	go func() {
-		defer connCleanup()
+		defer copies.Done()
 		var b [1 << 16]byte
 		io.CopyBuffer(netConn, r, b[:])
-		syscall.Shutdown(int(r.Fd()), syscall.SHUT_RD)
+		r.CloseRead()
 		if cw, ok := netConn.(interface{ CloseWrite() error }); ok {
 			cw.CloseWrite()
 		}
+	}()
+	go func() {
+		copies.Wait()
+		connCleanup()
 	}()
 
 	*connOut = fdC
@@ -417,13 +448,13 @@ func TsnetGetRemoteAddr(listener C.int, conn C.int, buf *C.char, buflen C.size_t
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	addr, ok := l.m[conn]
+	ip, ok := l.m[conn]
 	if !ok {
+		// set errmsg too: EBADF with an empty message is not debuggable
+		l.s.lastErr = fmt.Sprintf("libtailscale: getremoteaddr: no remote address recorded for conn %d on listener %d", conn, listener)
 		out[0] = '\x00'
 		return C.EBADF
 	}
-
-	ip := extractIP(addr.String())
 
 	n := copy(out, ip)
 	if n >= len(out) {
@@ -653,5 +684,171 @@ func TsnetEnableFunnelToLocalhostPlaintextHttp1(sd C.int, localhostPort C.int) C
 		return s.recErr(fmt.Errorf("libtailscale: failed to enable funnel"))
 	}
 
+	return 0
+}
+
+// packetListeners tracks tsnet UDP PacketConns surfaced to C as
+// datagram bridge descriptors. tsnet.Server.Listen does not support UDP
+// (Go's net.Listen has no UDP variant), so libtailscale upstream
+// only exposes TCP listeners. This adds a parallel UDP path via
+// tsnet.Server.ListenPacket. Each datagram on the socketpair is framed
+// as [1B addr_len][addr_bytes][payload] so the C side can preserve the
+// per-packet source/destination address — a real UDP socket gets that
+// from recvfrom/sendto, which the bridge can't pass through natively.
+var packetListeners struct {
+	mu sync.Mutex
+	m  map[C.int]*packetListener
+}
+
+type packetListener struct {
+	s    *server
+	pc   net.PacketConn
+	pkt  bridgePacket // go side of the datagram bridge pair
+	cFd  C.int        // C side fd (key in packetListeners.m)
+	once sync.Once
+}
+
+// closeOnce releases the listener exactly once regardless of which caller
+// arrives first — the external TsnetListenPacketClose or a bridge goroutine
+// exiting on its own (e.g. due to a write error). sync.Once guarantees the
+// body runs at most once even under concurrent calls.
+//
+// Ordering inside the body matters:
+//  1. Remove from the map first (under lock) so no new caller can see this pl.
+//  2. Close the Go side of the bridge pair — unblocks the read in the
+//     bridge→PacketConn goroutine.
+//  3. Close the C side of the socketpair (cFd) — fd is owned by Go end-to-end
+//     when called from TsnetListenPacketClose; Swift must not call Darwin.close
+//     on the same fd afterward.
+//  4. Close pc outside the lock — unblocks pc.ReadFrom in the other goroutine
+//     and synchronously releases the netstack port binding.
+func (pl *packetListener) closeOnce() {
+	pl.once.Do(func() {
+		packetListeners.mu.Lock()
+		delete(packetListeners.m, pl.cFd)
+		_ = pl.pkt.Close()
+		_ = closeBridgeCSide(pl.cFd)
+		packetListeners.mu.Unlock()
+		pl.pc.Close()
+	})
+}
+
+//export TsnetListenPacket
+func TsnetListenPacket(sd C.int, network, addr *C.char, listenerOut *C.int) C.int {
+	s := getServer(sd)
+	if s == nil {
+		return C.EBADF
+	}
+
+	networkStr := C.GoString(network)
+	pc, err := s.s.ListenPacket(networkStr, C.GoString(addr))
+	if err != nil {
+		return s.recErr(err)
+	}
+	s.started = true
+
+	// Default datagram socket buffers are a few KB. RTP at 60fps with the
+	// occasional keyframe burst will overflow that and the kernel will drop
+	// datagrams silently. 4 MB on each side is roughly half a second of
+	// 60Mbps video — enough headroom for a brief stall on the C side without
+	// losing frames.
+	const sockBuf = 4 * 1024 * 1024
+	pkt, fdC, err := newBridgePacketPair(sockBuf)
+	if err != nil {
+		pc.Close()
+		return s.recErr(err)
+	}
+
+	pl := &packetListener{s: s, pc: pc, pkt: pkt, cFd: fdC}
+	packetListeners.mu.Lock()
+	if packetListeners.m == nil {
+		packetListeners.m = map[C.int]*packetListener{}
+	}
+	packetListeners.m[fdC] = pl
+	packetListeners.mu.Unlock()
+
+	// PacketConn → bridge. Read each tailnet datagram, prepend its source
+	// address, write the framed message to the bridge as one datagram.
+	// Closing pc (via pl.closeOnce) breaks the ReadFrom loop.
+	go func() {
+		defer pl.closeOnce()
+		var buf [1 << 16]byte
+		for {
+			n, srcAddr, err := pc.ReadFrom(buf[:])
+			if err != nil {
+				return
+			}
+			addrStr := srcAddr.String()
+			if len(addrStr) > 255 {
+				// IP:port should never exceed 255 bytes; drop rather
+				// than truncate to keep the framing unambiguous.
+				continue
+			}
+			out := make([]byte, 1+len(addrStr)+n)
+			out[0] = byte(len(addrStr))
+			copy(out[1:], addrStr)
+			copy(out[1+len(addrStr):], buf[:n])
+			if _, err := pkt.Write(out); err != nil {
+				return
+			}
+		}
+	}()
+
+	// bridge → PacketConn. Read each framed message from the C
+	// side, resolve the destination address, write a UDP datagram. A
+	// short read or zero-length read means the C side closed its fd.
+	go func() {
+		defer pl.closeOnce()
+		var buf [1 << 16]byte
+		for {
+			n, err := pkt.Read(buf[:])
+			if err != nil || n == 0 {
+				return
+			}
+			if n < 1 {
+				continue
+			}
+			addrLen := int(buf[0])
+			if 1+addrLen > n {
+				continue // malformed; drop
+			}
+			addrStr := string(buf[1 : 1+addrLen])
+			payload := buf[1+addrLen : n]
+			udpAddr, err := net.ResolveUDPAddr(networkStr, addrStr)
+			if err != nil {
+				continue // bad addr; UDP is lossy, drop and move on
+			}
+			// Best-effort send. WriteTo errors on a single datagram
+			// (e.g. EHOSTUNREACH) shouldn't tear down the listener.
+			pc.WriteTo(payload, udpAddr)
+		}
+	}()
+
+	*listenerOut = fdC
+	return 0
+}
+
+// TsnetListenPacketClose closes the UDP packet listener identified by fdC.
+//
+// Unlike the C side calling Darwin.close(fd), this function closes the
+// listener synchronously: it calls pc.Close() on the underlying netstack
+// PacketConn before returning, so the port is immediately available for a
+// subsequent TsnetListenPacket call on the same address.
+//
+// It is safe to call concurrently with the bridge goroutines; sync.Once
+// ensures the teardown body executes exactly once regardless of which caller
+// arrives first.
+//
+// Returns 0 on success, EBADF if fdC is not a live packet listener.
+//
+//export TsnetListenPacketClose
+func TsnetListenPacketClose(fdC C.int) C.int {
+	packetListeners.mu.Lock()
+	pl, ok := packetListeners.m[fdC]
+	packetListeners.mu.Unlock()
+	if !ok {
+		return C.EBADF
+	}
+	pl.closeOnce()
 	return 0
 }
